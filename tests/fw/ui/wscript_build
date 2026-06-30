@@ -40,6 +40,7 @@ clar(ctx,
         " src/fw/applib/graphics/graphics_circle.c"
         " src/fw/applib/graphics/graphics_line.c"
         " src/fw/applib/graphics/text_layout.c"
+        " src/fw/applib/graphics/bidi.c"
         " src/fw/applib/graphics/rtl_support.c"
         " src/fw/applib/graphics/arabic_shaping.c"
         " src/fw/applib/graphics/utf8.c"
@@ -196,6 +197,7 @@ menu_layer_system_cell_rendering_sources = \
     " src/fw/applib/graphics/gtypes.c" \
     " src/fw/applib/graphics/perimeter.c" \
     " src/fw/applib/graphics/text_layout.c" \
+    " src/fw/applib/graphics/bidi.c" \
     " src/fw/applib/graphics/rtl_support.c" \
     " src/fw/applib/graphics/arabic_shaping.c" \
     " src/fw/applib/graphics/text_render.c" \

@@ -5,9 +5,9 @@
 
 #include <string.h>
 
-// Caps codepoints per shaping call. Sized to match walk_line's 128-byte
-// shape buffer (~64 Arabic codepoints at 2 UTF-8 bytes each).
-#define MAX_SHAPE_CODEPOINTS 64
+// Caps codepoints per shaping call. Sized to cover a whole display line, which
+// the bidi layout shapes in one pass (matches BIDI_MAX_CODEPOINTS).
+#define MAX_SHAPE_CODEPOINTS 96
 
 // Connectivity flags for Arabic letters
 #define JOIN_NONE       0x00  // Does not connect (space, punctuation)

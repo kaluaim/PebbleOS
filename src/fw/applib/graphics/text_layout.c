@@ -15,6 +15,7 @@
 #include "text_layout_private.h"
 
 #include "arabic_shaping.h"
+#include "bidi.h"
 #include "graphics.h"
 #include "graphics_private.h"
 #include "gtypes.h"
@@ -682,268 +683,121 @@ utf8_t* walk_line(GContext* ctx, Line* line, const TextBoxParams* const text_box
       text_box_params->utf8_bounds->end > line->start &&
       utf8_contains_rtl(line->start, text_box_params->utf8_bounds->end)) {
 
-    // Segment descriptor for BiDi reordering
-    // Headroom for splitting boundary spaces into their own neutral segments.
-    #define MAX_BIDI_SEGMENTS 16
-    typedef struct {
-      utf8_t *start;
-      utf8_t *end;
-      bool is_rtl;
-    } BiDiSegment;
-
-    BiDiSegment segments[MAX_BIDI_SEGMENTS];
-    int num_segments = 0;
-
-    utf8_t *ptr = (utf8_t *)line->start;
+    // Render the line with the bidirectional algorithm: find the logical range
+    // that fits, Arabic-shape it, reorder to visual order and draw left to right.
     utf8_t *line_end = (utf8_t *)text_box_params->utf8_bounds->end;
-    int total_width_px = 0;
 
-    // Pass 1: Collect all segments with their boundaries and directions
-    while (ptr < line_end && *ptr != '\0' && *ptr != '\n' &&
-           total_width_px + suffix_width_px <= available_horiz_px &&
-           num_segments < MAX_BIDI_SEGMENTS) {
-
-      utf8_t *segment_start = ptr;
-      utf8_t *next = NULL;
-      Codepoint first_cp = utf8_peek_codepoint(ptr, &next);
-      if (first_cp == 0 || next == NULL) break;
-
-      // Skip leading punctuation/spaces to determine segment type
-      bool segment_is_rtl = false;
-      utf8_t *check_ptr = ptr;
-      while (check_ptr < line_end && *check_ptr != '\0' && *check_ptr != '\n') {
-        utf8_t *check_next = NULL;
-        Codepoint check_cp = utf8_peek_codepoint(check_ptr, &check_next);
-        if (check_cp == 0 || check_next == NULL) break;
-        if (!prv_codepoint_is_punctuation(check_cp) &&
-            check_cp != SPACE_CODEPOINT && !codepoint_is_zero_width(check_cp)) {
-          segment_is_rtl = codepoint_is_rtl(check_cp);
+    // Walk the logical text accumulating shaped (ligature-folded, mark-aware)
+    // advances - the same arithmetic measurement uses - to find where this line
+    // ends within the available width.
+    int content_width_px = 0;
+    Codepoint prev_cp = 0;
+    bool skip_ligature_member = false;
+    utf8_t *fit_end = line->start;
+    utf8_t *p = (utf8_t *)line->start;
+    while (p < line_end && *p != '\0' && *p != '\n') {
+      utf8_t *pnext = NULL;
+      Codepoint cp = utf8_peek_codepoint(p, &pnext);
+      if (cp == 0 || pnext == NULL) {
+        break;
+      }
+      if (prv_codepoint_is_invisible(cp)) {
+        p = pnext;
+        fit_end = p;
+        continue;
+      }
+      if (skip_ligature_member && !arabic_is_transparent(cp)) {
+        // Alef already counted in the preceding Lam-Alef ligature.
+        skip_ligature_member = false;
+      } else {
+        int glyph_width;
+        if (arabic_is_transparent(cp)) {
+          glyph_width = prv_codepoint_get_horizontal_advance(&ctx->font_cache,
+              text_box_params->font, cp);
+        } else {
+          Codepoint next_cp = prv_peek_next_letter(p, line_end);
+          glyph_width = prv_shaped_glyph_advance(ctx, text_box_params, prev_cp, cp, next_cp,
+                                                 &skip_ligature_member);
+        }
+        if (content_width_px + glyph_width + suffix_width_px > available_horiz_px) {
           break;
         }
-        check_ptr = check_next;
+        content_width_px += glyph_width;
       }
-
-      // Collect segment (until we hit opposite script type or end)
-      utf8_t *segment_end = ptr;
-      int segment_width_px = 0;
-      // Track previous codepoint within the segment so Arabic letters are
-      // measured using their contextual presentation form. Without this,
-      // segment width here disagrees with the shaped width used by the
-      // layout (word_init) and by the actual draw pass below — letters at
-      // the line edge get truncated and a gap appears.
-      Codepoint prev_seg_cp = 0;
-      // arabic_shape_pair() may combine this codepoint with the next into one
-      // Lam-Alef ligature glyph and report the next as consumed; its advance is
-      // then already counted, so skip it on the following iteration.
-      bool skip_ligature_member = false;
-      while (segment_end < line_end && *segment_end != '\0' && *segment_end != '\n') {
-        utf8_t *seg_next = NULL;
-        Codepoint seg_cp = utf8_peek_codepoint(segment_end, &seg_next);
-        if (seg_cp == 0 || seg_next == NULL) break;
-
-        // Skip invisible codepoints (ZWJ, variation selectors, skin tone modifiers)
-        if (prv_codepoint_is_invisible(seg_cp)) {
-          segment_end = seg_next;
-          continue;
-        }
-
-        // Check if this character changes the segment type
-        if (!prv_codepoint_is_punctuation(seg_cp) &&
-            seg_cp != SPACE_CODEPOINT && !codepoint_is_zero_width(seg_cp)) {
-          bool char_is_rtl = codepoint_is_rtl(seg_cp);
-          if (char_is_rtl != segment_is_rtl) {
-            break;  // End of segment
-          }
-        }
-
-        // Trailing spaces are kept in the run here and split out after the loop
-        // (see the trailing-space peel below) so they reorder between runs.
-
-        if (skip_ligature_member && !arabic_is_transparent(seg_cp)) {
-          // Alef already counted in the preceding Lam-Alef ligature.
-          skip_ligature_member = false;
-        } else {
-          Codepoint width_cp;
-          if (arabic_is_transparent(seg_cp)) {
-            // A mark keeps its own width but is not reshaped.
-            width_cp = seg_cp;
-          } else {
-            Codepoint next_seg_cp = prv_peek_next_letter(segment_end, line_end);
-            bool consumed_next = false;
-            width_cp = arabic_shape_pair(prev_seg_cp, seg_cp, next_seg_cp, &consumed_next);
-            skip_ligature_member = consumed_next;
-          }
-          int glyph_width = prv_codepoint_get_horizontal_advance(&ctx->font_cache,
-              text_box_params->font, width_cp);
-          if (total_width_px + segment_width_px + glyph_width + suffix_width_px > available_horiz_px) {
-            break;
-          }
-          segment_width_px += glyph_width;
-        }
-
-        if (!arabic_is_transparent(seg_cp)) {
-          prev_seg_cp = seg_cp;
-        }
-        segment_end = seg_next;
+      if (!arabic_is_transparent(cp)) {
+        prev_cp = cp;
       }
-      size_t segment_len = segment_end - segment_start;
-      if (segment_len == 0) break;
-
-      // Peel trailing spaces into their own neutral segment. A space between
-      // two runs is direction-neutral: if it stays inside a run it is reversed
-      // with that run and the segment reorder then carries it to the run's far
-      // edge, so the gap separating the two runs collapses. As its own segment
-      // it stays put between the runs it separates.
-      utf8_t *content_end = rtl_segment_content_end(segment_start, segment_end);
-
-      if (content_end > segment_start && content_end < segment_end) {
-        // strong-direction content, then the trailing space(s) as a neutral
-        segments[num_segments++] = (BiDiSegment){
-          .start = segment_start, .end = content_end, .is_rtl = segment_is_rtl,
-        };
-        if (num_segments < MAX_BIDI_SEGMENTS) {
-          segments[num_segments++] = (BiDiSegment){
-            .start = content_end, .end = segment_end, .is_rtl = false,
-          };
-        }
-      } else {
-        segments[num_segments++] = (BiDiSegment){
-          .start = segment_start, .end = segment_end, .is_rtl = segment_is_rtl,
-        };
-      }
-      total_width_px += segment_width_px;
-      ptr = segment_end;
+      p = pnext;
+      fit_end = p;
     }
 
-    // Pass 2: Reorder segments for RTL paragraph direction
-    // When the line starts with RTL text, the visual order of segments must be
-    // reversed so the first logical segment appears on the right (reading start)
-    bool line_is_rtl = prv_utf8_starts_with_rtl(line->start, text_box_params->utf8_bounds->end);
-    if (line_is_rtl && num_segments > 1) {
-      for (int i = 0; i < num_segments / 2; i++) {
-        BiDiSegment temp = segments[i];
-        segments[i] = segments[num_segments - 1 - i];
-        segments[num_segments - 1 - i] = temp;
-      }
-    }
-
-    // Pass 3: Render segments in (possibly reordered) visual order
+    // Shape the fitting range in logical order, then reorder it to visual order
+    // and draw each glyph left to right.
     int walked_width_px = 0;
-    utf8_t *last_visited_char = NULL;
-    utf8_t rtl_buffer[128];
-    const size_t rtl_buffer_size = sizeof(rtl_buffer);
-
-    for (int seg_idx = 0; seg_idx < num_segments; seg_idx++) {
-      BiDiSegment *seg = &segments[seg_idx];
-      size_t seg_len = seg->end - seg->start;
-
-      if (seg->is_rtl) {
-        // Shape, reverse, render. Buffers sized to fit any single line on
-        // 200-260 px displays; shaping expands Arabic basic-block (2 UTF-8
-        // bytes) to presentation forms (3 bytes).
-        size_t render_len = seg_len;
-        size_t reversed_len = 0;
-
-        if (render_len > rtl_buffer_size - 4) {
-          render_len = rtl_buffer_size - 4;
+    size_t fit_len = (size_t)(fit_end - line->start);
+    if (fit_len > 0) {
+      size_t scratch_size = fit_len * 2 + 8;  // shaping may expand 2-byte -> 3-byte forms
+      utf8_t *shaped = applib_malloc(scratch_size);
+      utf8_t *visual = applib_malloc(scratch_size);
+      if (shaped && visual) {
+        size_t shaped_len = arabic_shape_text(line->start, fit_len, shaped, scratch_size - 1);
+        size_t visual_len = 0;
+        if (shaped_len > 0) {
+          shaped[shaped_len] = '\0';
+          // Base direction is a paragraph property (UAX#9 P2/P3): use the
+          // paragraph's first strong character so a wrapped continuation line
+          // that happens to start with the opposite script keeps the same base.
+          int base_level =
+              prv_utf8_starts_with_rtl(text_box_params->utf8_bounds->start, line_end) ? 1 : 0;
+          visual_len = bidi_reorder_utf8(shaped, shaped_len, visual, scratch_size, base_level);
         }
-
-        if (utf8_contains_arabic(seg->start, seg->end)) {
-          utf8_t *shaped_buffer = applib_malloc(rtl_buffer_size);
-          if (shaped_buffer) {
-            size_t shaped_len = arabic_shape_text(seg->start, render_len,
-                                                  shaped_buffer, rtl_buffer_size - 1);
-            if (shaped_len > 0) {
-              shaped_buffer[shaped_len] = '\0';
-              reversed_len = utf8_reverse_for_rtl(shaped_buffer, shaped_len,
-                                                  rtl_buffer, rtl_buffer_size - 1);
+        if (visual_len > 0) {
+          visual[visual_len] = '\0';
+          utf8_t *vptr = visual;
+          while (*vptr != '\0') {
+            utf8_t *vnext = NULL;
+            Codepoint vcp = utf8_peek_codepoint(vptr, &vnext);
+            if (vcp == 0 || vnext == NULL) {
+              break;
             }
-            applib_free(shaped_buffer);
-          }
-        }
-
-        if (reversed_len == 0) {
-          reversed_len = utf8_reverse_for_rtl(seg->start, render_len,
-                                              rtl_buffer, rtl_buffer_size - 1);
-        }
-
-        if (reversed_len > 0) {
-          rtl_buffer[reversed_len] = '\0';
-
-          utf8_t *rptr = rtl_buffer;
-          while (*rptr != '\0') {
-            utf8_t *rnext = NULL;
-            Codepoint rcp = utf8_peek_codepoint(rptr, &rnext);
-            if (rcp == 0 || rnext == NULL) break;
-            if (prv_codepoint_is_invisible(rcp)) { rptr = rnext; continue; }
-
+            if (prv_codepoint_is_invisible(vcp)) {
+              vptr = vnext;
+              continue;
+            }
             int glyph_width = prv_codepoint_get_horizontal_advance(&ctx->font_cache,
-                text_box_params->font, rcp);
-
+                text_box_params->font, vcp);
             GRect cursor = {
               .origin = line->origin,
               .size.w = glyph_width,
-              .size.h = fonts_get_font_height(text_box_params->font)
+              .size.h = fonts_get_font_height(text_box_params->font),
             };
             cursor.origin.x += walked_width_px;
-
-            if (!codepoint_is_zero_width(rcp)) {
-              text_resources_get_glyph(&ctx->font_cache, rcp, text_box_params->font);
-              render_glyph(ctx, rcp, text_box_params->font, cursor);
+            if (!codepoint_is_zero_width(vcp)) {
+              text_resources_get_glyph(&ctx->font_cache, vcp, text_box_params->font);
+              render_glyph(ctx, vcp, text_box_params->font, cursor);
             }
-
             walked_width_px += glyph_width;
-            rptr = rnext;
+            vptr = vnext;
           }
         }
-      } else {
-        // LTR segment: render normally
-        utf8_t *sptr = seg->start;
-        while (sptr < seg->end) {
-          utf8_t *snext = NULL;
-          Codepoint scp = utf8_peek_codepoint(sptr, &snext);
-          if (scp == 0 || snext == NULL) break;
-          if (prv_codepoint_is_invisible(scp)) { sptr = snext; continue; }
-
-          int glyph_width = prv_codepoint_get_horizontal_advance(&ctx->font_cache,
-              text_box_params->font, scp);
-
-          GRect cursor = {
-            .origin = line->origin,
-            .size.w = glyph_width,
-            .size.h = fonts_get_font_height(text_box_params->font)
-          };
-          cursor.origin.x += walked_width_px;
-
-          if (!codepoint_is_zero_width(scp)) {
-            text_resources_get_glyph(&ctx->font_cache, scp, text_box_params->font);
-            render_glyph(ctx, scp, text_box_params->font, cursor);
-          }
-
-          walked_width_px += glyph_width;
-          sptr = snext;
-        }
       }
-
-      // Track last visited char (furthest position in original text)
-      if (last_visited_char == NULL || seg->start > last_visited_char) {
-        last_visited_char = seg->start;
-      }
+      applib_free(shaped);
+      applib_free(visual);
     }
 
-    // Handle suffix if present
+    // Suffix (hyphen / ellipsis), drawn after the visual content.
     if (line->suffix_codepoint) {
       GRect cursor = {
         .origin = line->origin,
         .size.w = suffix_width_px,
-        .size.h = fonts_get_font_height(text_box_params->font)
+        .size.h = fonts_get_font_height(text_box_params->font),
       };
       cursor.origin.x += walked_width_px;
       text_resources_get_glyph(&ctx->font_cache, line->suffix_codepoint, text_box_params->font);
       render_glyph(ctx, line->suffix_codepoint, text_box_params->font, cursor);
     }
 
-    return last_visited_char;
+    return fit_end;
   }
 
   // Standard rendering path (no RTL or not rendering)
@@ -1408,9 +1262,12 @@ static void prv_line_justify(Line* line, const TextBoxParams* const text_box_par
   // Determine effective alignment - RTL text defaults to right alignment
   GTextAlignment effective_alignment = text_box_params->alignment;
 
-  // If alignment is left (default) and text starts with RTL, switch to right
+  // If alignment is left (default) and the paragraph starts with RTL, switch to
+  // right. Use the paragraph start (not the line) so every wrapped line of an
+  // RTL paragraph aligns the same way.
   if (effective_alignment == GTextAlignmentLeft && line->start != NULL) {
-    if (prv_utf8_starts_with_rtl(line->start, text_box_params->utf8_bounds->end)) {
+    if (prv_utf8_starts_with_rtl(text_box_params->utf8_bounds->start,
+                                 text_box_params->utf8_bounds->end)) {
       effective_alignment = GTextAlignmentRight;
     }
   }
