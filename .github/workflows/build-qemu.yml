@@ -1,0 +1,93 @@
+name: Build Firmware (QEMU)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  changes-qemu:
+    runs-on: ubuntu-24.04
+    permissions:
+      pull-requests: read
+    outputs:
+      should-build: ${{ github.event_name == 'push' || steps.filter.outputs.src == 'true' }}
+    steps:
+      - uses: dorny/paths-filter@v4
+        if: github.event_name == 'pull_request'
+        id: filter
+        with:
+          filters: |
+            src:
+              - '.github/actions/**'
+              - '.github/workflows/build-qemu.yml'
+              - 'platform/**'
+              - 'resources/**'
+              - 'sdk/**'
+              - 'src/**'
+              - 'stored_apps/**'
+              - 'tools/**'
+              - 'third_party/**'
+              - 'tools/waf/**'
+              - 'waf'
+              - 'wscript'
+
+  build-qemu:
+    needs: changes-qemu
+    if: needs.changes-qemu.outputs.should-build == 'true'
+    runs-on: ubuntu-24.04
+
+    container:
+      image: ghcr.io/coredevices/pebbleos-docker:v6
+
+    strategy:
+      matrix:
+        board: ["qemu_flint", "qemu_emery", "qemu_gabbro"]
+
+    steps:
+      - name: Mark Github workspace as safe
+        run: git config --system --add safe.directory "${GITHUB_WORKSPACE}" 
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      - name: Rebase onto target branch
+        uses: ./.github/actions/rebase
+        with:
+          submodules: true
+
+      - name: Install Python dependencies
+        run: |
+          pip install -U pip
+          pip install -r requirements.txt
+
+      - name: Get npm cache directory
+        id: npm-cache-dir
+        shell: bash
+        run: echo "dir=$(npm config get cache)" >> ${GITHUB_OUTPUT}
+
+      - name: Configure
+        run: ./waf configure --board ${{ matrix.board }}
+
+      - name: Build
+        run: ./waf build qemu_image_micro qemu_image_spi
+
+      - name: Store
+        uses: actions/upload-artifact@v6
+        with:
+          name: firmware-${{ matrix.board }}-qemu
+          path: |
+            build/qemu_micro_flash.bin
+            build/qemu_spi_flash.bin
+
+  build-qemu-status:
+    needs: [changes-qemu, build-qemu]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - if: needs.build-qemu.result == 'failure' || needs.build-qemu.result == 'cancelled'
+        run: exit 1

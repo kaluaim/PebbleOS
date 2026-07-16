@@ -1,0 +1,9 @@
+---
+BasedOnStyle: Google
+IndentWidth: 2
+UseTab: Never
+PointerAlignment: Right
+ColumnLimit: 100
+SortIncludes: Never
+AllowShortFunctionsOnASingleLine: Empty
+---

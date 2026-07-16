@@ -1,0 +1,127 @@
+name: Build Firmware
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  changes-firmware:
+    runs-on: ubuntu-24.04
+    permissions:
+      pull-requests: read
+    outputs:
+      should-build: ${{ github.event_name == 'push' || steps.filter.outputs.src == 'true' }}
+    steps:
+      - uses: dorny/paths-filter@v4
+        if: github.event_name == 'pull_request'
+        id: filter
+        with:
+          filters: |
+            src:
+              - '.github/actions/**'
+              - '.github/workflows/build-firmware.yml'
+              - 'boards/**'
+              - 'platform/**'
+              - 'resources/**'
+              - 'sdk/**'
+              - 'src/**'
+              - 'stored_apps/**'
+              - 'tools/**'
+              - 'third_party/**'
+              - 'tools/waf/**'
+              - 'waf'
+              - 'wscript'
+
+  build-firmware:
+    needs: changes-firmware
+    if: needs.changes-firmware.outputs.should-build == 'true'
+    runs-on: ubuntu-24.04
+
+    container:
+      image: ghcr.io/coredevices/pebbleos-docker:v6
+
+    strategy:
+      matrix:
+        board:
+          - asterix
+          - obelix@dvt
+          - obelix@pvt
+          - getafix@evt
+          - getafix@dvt
+          - getafix@dvt2
+
+    steps:
+      - name: Mark Github workspace as safe
+        run: git config --system --add safe.directory "${GITHUB_WORKSPACE}"
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      - name: Rebase onto target branch
+        uses: ./.github/actions/rebase
+        with:
+          submodules: true
+
+      - name: Install Python dependencies
+        run: |
+          pip install -U pip
+          pip install -r requirements.txt
+
+      - name: Get npm cache directory
+        id: npm-cache-dir
+        shell: bash
+        run: echo "dir=$(npm config get cache)" >> ${GITHUB_OUTPUT}
+
+      - name: Set artifact board name
+        id: artifact_board
+        run: echo "NAME=$(printf '%s' "$BOARD" | tr @ _)" >> "$GITHUB_OUTPUT"
+        env:
+          BOARD: ${{ matrix.board }}
+
+      - name: Configure
+        run: ./waf configure --board '${{ matrix.board }}'
+
+      - name: Build
+        run: ./waf build
+
+      - name: Bundle
+        run: ./waf bundle
+
+      - name: Store
+        uses: actions/upload-artifact@v6
+        with:
+          name: firmware-${{ steps.artifact_board.outputs.NAME }}
+          path: |
+            build/**/*.elf
+            build/**/*.pbz
+            build/pebbleos_loghash_dict.json
+
+      - name: Get Build ID
+        id: build_id
+        run: |
+          echo "BUILD_ID=$(readelf -n build/pebbleos.elf | sed -n -e 's/^.*Build ID: //p')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload log hash dictionary
+        if: ${{ github.event_name == 'push' && github.repository == 'coredevices/PebbleOS' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.LOG_HASH_BUCKET_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.LOG_HASH_BUCKET_SECRET }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          pip install awscli
+          aws s3 cp build/pebbleos_loghash_dict.json \
+            "s3://${{ vars.LOG_HASH_BUCKET_NAME }}/${{ steps.build_id.outputs.BUILD_ID }}-${{ github.sha }}-normal.json" \
+            --endpoint-url "${{ vars.LOG_HASH_BUCKET_ENDPOINT }}"
+
+  build-firmware-status:
+    needs: [changes-firmware, build-firmware]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - if: needs.build-firmware.result == 'failure' || needs.build-firmware.result == 'cancelled'
+        run: exit 1

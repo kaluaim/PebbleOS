@@ -1,0 +1,13 @@
+[general]
+extra-path=tools/gitlint
+contrib=contrib-body-requires-signed-off-by,contrib-disallow-cleanup-commits
+ignore-merge-commits=false
+ignore-fixup-commits=false
+ignore-fixup-amend-commits=false
+ignore-squash-commits=false
+
+[title-match-regex]
+regex=[a-z0-9/]+: .*
+
+[title-max-length]
+line-length=100

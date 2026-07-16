@@ -1,0 +1,125 @@
+name: Compliance checks
+
+on:
+  pull_request: {}
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Rebase onto target branch
+        uses: ./.github/actions/rebase
+
+      - name: Install GitLint
+        run: pip install gitlint
+
+      - name: Run GitLint
+        run: gitlint --commits "origin/${GITHUB_BASE_REF}..HEAD"
+
+  ruff:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Rebase onto target branch
+        uses: ./.github/actions/rebase
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Run ruff format check
+        run: |
+          base="origin/${GITHUB_BASE_REF}"
+
+          # collect submodule paths to skip
+          submodules=$(git config --file .gitmodules --get-regexp '\.path$' \
+            | awk '{print $2}')
+
+          files=()
+          for file in $(git diff --name-only --diff-filter=d "$base"...HEAD -- '*.py'); do
+            skip=false
+            for sm in $submodules; do
+              case "$file" in "$sm"/*) skip=true; break ;; esac
+            done
+            if $skip; then continue; fi
+            files+=("$file")
+          done
+
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No Python files changed."
+            exit 0
+          fi
+
+          ruff format --check "${files[@]}"
+
+  license:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Rebase onto target branch
+        uses: ./.github/actions/rebase
+
+      - name: Check SPDX license headers
+        run: |
+          base="origin/${GITHUB_BASE_REF}"
+          failed_files=()
+
+          # collect submodule paths to skip
+          submodules=$(git config --file .gitmodules --get-regexp '\.path$' \
+            | awk '{print $2}')
+
+          for file in $(git diff --name-only --diff-filter=d "$base"...HEAD -- \
+            '*.c' '*.h' '*.S' '*.py' '*.sh'); do
+            # skip files inside git submodules
+            skip=false
+            for sm in $submodules; do
+              case "$file" in "$sm"/*) skip=true; break ;; esac
+            done
+            if $skip; then continue; fi
+
+            if ! head -10 "$file" | grep -q "SPDX-License-Identifier: Apache-2.0"; then
+              # Resolve the file's pre-PR identity: either same path or
+              # the source of a rename.
+              origin="$file"
+              if ! git cat-file -e "$base":"$origin" 2>/dev/null; then
+                origin=$(git diff --find-renames --diff-filter=R --name-status \
+                  "$base"...HEAD | awk -v f="$file" '$3 == f {print $2}')
+              fi
+
+              # If the file (or its rename source) existed before this PR and
+              # already lacked Apache-2.0, skip it as pre-existing.
+              if [ -n "$origin" ] && git cat-file -e "$base":"$origin" 2>/dev/null; then
+                if ! git show "$base":"$origin" | head -10 \
+                    | grep -q "SPDX-License-Identifier: Apache-2.0"; then
+                  echo "::notice file=$file::Skipping: pre-existing non-Apache-2.0 license"
+                  continue
+                fi
+              fi
+              echo "::error file=$file::Missing 'SPDX-License-Identifier: Apache-2.0' header"
+              failed_files+=("$file")
+            fi
+          done
+
+          if [ ${#failed_files[@]} -ne 0 ]; then
+            echo ""
+            echo "${#failed_files[@]} file(s) missing Apache-2.0 SPDX license header:"
+            for f in "${failed_files[@]}"; do
+              echo "  - $f"
+            done
+            echo ""
+            echo "Expected within the first 10 lines:"
+            echo "  /* SPDX-License-Identifier: Apache-2.0 */"
+            exit 1
+          fi
