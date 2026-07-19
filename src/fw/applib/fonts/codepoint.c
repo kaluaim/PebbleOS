@@ -218,8 +218,3 @@ bool codepoint_is_special(const Codepoint codepoint) {
   return (codepoint >= MIN_SPECIAL_CODEPOINT &&
           codepoint <= MAX_SPECIAL_CODEPOINT);
 }
-
-bool codepoint_is_rtl(const Codepoint codepoint) {
-  return (codepoint >= MIN_ARABIC_CODEPOINT && codepoint <= MAX_ARABIC_CODEPOINT) ||
-         (codepoint >= MIN_HEBREW_CODEPOINT && codepoint <= MAX_HEBREW_CODEPOINT);
-}

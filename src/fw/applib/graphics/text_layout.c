@@ -15,16 +15,17 @@
 #include "text_layout_private.h"
 
 #include "arabic_shaping.h"
+#include "bidi.h"
 #include "graphics.h"
 #include "graphics_private.h"
 #include "gtypes.h"
-#include "rtl_support.h"
 #include "text_render.h"
 #include "text_resources.h"
 #include "utf8.h"
 
 #include "applib/fonts/codepoint.h"
 #include "applib/fonts/fonts.h"
+#include "kernel/pbl_malloc.h"
 #include "kernel/ui/kernel_ui.h"
 #include "process_state/app_state/app_state.h"
 #include "applib/applib_malloc.auto.h"
@@ -42,54 +43,94 @@
 #include <limits.h>
 
 static bool prv_char_iter_next_start_of_word(Iterator* char_iter);
+static int prv_mirror_aware_advance(GContext *ctx, const TextBoxParams *text_box_params,
+                                    Codepoint cp, int advance);
+static bool prv_paragraph_may_reorder(const TextBoxParams *text_box_params, const utf8_t *pos,
+                                      bool nl_as_space);
 
 //! Check if a codepoint is invisible: formatting indicator or should-skip (no direction, no width).
 static bool prv_codepoint_is_invisible(Codepoint cp) {
   return codepoint_is_formatting_indicator(cp) || codepoint_should_skip(cp);
 }
 
-//! Check if a codepoint is punctuation (should be ignored for RTL detection)
-static bool prv_codepoint_is_punctuation(Codepoint cp) {
-  // ASCII punctuation
-  if ((cp >= 0x21 && cp <= 0x2F) ||  // ! " # $ % & ' ( ) * + , - . /
-      (cp >= 0x3A && cp <= 0x40) ||  // : ; < = > ? @
-      (cp >= 0x5B && cp <= 0x60) ||  // [ \ ] ^ _ `
-      (cp >= 0x7B && cp <= 0x7E)) {  // { | } ~
-    return true;
+//! Last non-transparent codepoint in the raw bytes [from, to), or 0 if none.
+//! The character iterator filters formatting codepoints (ZWNJ, directional
+//! marks) out of the stream, but they still break Arabic joining, so any
+//! shaping context that tracks the previous codepoint from the iterator must
+//! check the raw gap it skipped.
+static Codepoint prv_last_raw_cp_between(const utf8_t *from, const utf8_t *to) {
+  Codepoint found = 0;
+  utf8_t *q = (utf8_t *)from;
+  while (q != NULL && to != NULL && q < to && *q != '\0') {
+    utf8_t *qnext = NULL;
+    Codepoint qcp = utf8_peek_codepoint(q, &qnext);
+    if (qcp == 0 || qnext == NULL) break;
+    if (!arabic_is_transparent(qcp)) found = qcp;
+    q = qnext;
   }
-  // General punctuation block (U+2000-U+206F) - includes dashes, quotes, etc.
-  if (cp >= 0x2000 && cp <= 0x206F) {
-    return true;
-  }
-  return false;
+  return found;
 }
 
-//! Check if text starts with an RTL (right-to-left) character
-//! Skips leading whitespace, newlines, and punctuation to find the first letter
-static bool prv_utf8_starts_with_rtl(const utf8_t *start, const utf8_t *end) {
-  if (start == NULL || end == NULL || start >= end) {
-    return false;
-  }
-
-  utf8_t *ptr = (utf8_t *)start;
-  while (ptr < end && *ptr != '\0') {
-    utf8_t *next = NULL;
-    Codepoint cp = utf8_peek_codepoint(ptr, &next);
-    if (cp == 0 || next == NULL) {
+//! Arabic joining context for text starting at pos: the last non-transparent
+//! codepoint before it in the box, or 0 at the very start. A newline or any
+//! non-Arabic codepoint breaks the join naturally, so this is safe across
+//! paragraphs. Measurement, the bidi fit scan and the bidi line builder must
+//! all use this same context, or a hyphenated intraword wrap measures a
+//! different form (and width) than it draws - losing or doubling a glyph at
+//! the wrap.
+static Codepoint prv_joining_context_before(const TextBoxParams *const text_box_params,
+                                            const utf8_t *pos) {
+  Codepoint prev = 0;
+  if (text_box_params->utf8_bounds == NULL || pos == NULL) return 0;
+  utf8_t *q = (utf8_t *)text_box_params->utf8_bounds->start;
+  // A join never survives a newline, so start at the last one before pos.
+  for (utf8_t *r = (utf8_t *)pos; r > q; r--) {
+    if (r[-1] == '\n') {
+      q = r;
       break;
     }
-    // Skip whitespace, newlines, punctuation, and invisible codepoints
-    if (cp == SPACE_CODEPOINT || cp == NEWLINE_CODEPOINT ||
-        codepoint_is_zero_width(cp) || prv_codepoint_is_punctuation(cp) ||
-        prv_codepoint_is_invisible(cp)) {
-      ptr = next;
-      continue;
-    }
-    // Found first letter character, check if RTL
-    return codepoint_is_rtl(cp);
   }
-  return false;
+  while (q != NULL && q < pos && *q != '\0') {
+    utf8_t *qnext = NULL;
+    Codepoint qcp = utf8_peek_codepoint(q, &qnext);
+    if (qcp == 0 || qnext == NULL) break;
+    if (!arabic_is_transparent(qcp)) prev = qcp;
+    q = qnext;
+  }
+  return prev;
 }
+
+
+//! Bounds of the paragraph containing pos: from just past the previous newline
+//! (or the box start) to the next newline (or the box end). The bidi base
+//! direction and the RTL gate are paragraph properties (UAX 9 P2/P3), so both
+//! must look at exactly this range - not the whole text box.
+//! The backward scan is per line, so a paragraph of length N costs O(N) per
+//! wrapped line. Deliberate: watch text boxes are at most a few hundred bytes
+//! and multi-paragraph text exits at the nearest newline, so caching paragraph
+//! bounds across lines is not worth the state it would add.
+static void prv_paragraph_bounds(const utf8_t *box_start, const utf8_t *box_end,
+                                 const utf8_t *pos, bool nl_as_space,
+                                 utf8_t **para_start, utf8_t **para_end) {
+  // In Fill mode a newline is rendered as a space, not a paragraph break, so
+  // the whole box is one paragraph for base-direction purposes.
+  if (nl_as_space) {
+    *para_start = (utf8_t *)box_start;
+    *para_end = (utf8_t *)box_end;
+    return;
+  }
+  utf8_t *start = (utf8_t *)box_start;
+  for (utf8_t *q = (utf8_t *)pos; q > (utf8_t *)box_start; q--) {
+    if (q[-1] == '\n') {
+      start = q;
+      break;
+    }
+  }
+  utf8_t *end = memchr(pos, '\n', (size_t)(box_end - pos));
+  *para_start = start;
+  *para_end = (end != NULL) ? end : (utf8_t *)box_end;
+}
+
 
 // PBL-23045 Eventually remove perimeter debugging
 void graphics_text_perimeter_debugging_enable(bool enable) {
@@ -284,6 +325,8 @@ bool word_init(GContext* ctx, Word* word, const TextBoxParams* const text_box_pa
   bool skip_ligature_member = false;
   const utf8_t *bounds_end =
       (text_box_params->utf8_bounds != NULL) ? text_box_params->utf8_bounds->end : NULL;
+  const bool may_reorder = prv_paragraph_may_reorder(text_box_params, word->start,
+      text_box_params->overflow_mode == GTextOverflowModeFill);
 
   do {
     utf8_t *curr_pos = utf8_iter_state->current;
@@ -299,18 +342,37 @@ bool word_init(GContext* ctx, Word* word, const TextBoxParams* const text_box_pa
         word->width_px += prv_codepoint_get_horizontal_advance(&ctx->font_cache,
             text_box_params->font, curr_cp);
       } else {
-        Codepoint shape_next =
-            arabic_is_transparent(next_cp) ? prv_peek_next_letter(curr_pos, bounds_end) : next_cp;
+        // Raw peek, not the iterator's next: a filtered-out formatting
+        // codepoint between two letters must break the join here just as it
+        // does in the render fit scan and line builder. ZWNJ breaks the join
+        // per Unicode; ZWJ is join-causing there but breaks it here too, a
+        // deliberate simplification kept identical across all three stages so
+        // measurement and rendering never disagree.
+        Codepoint shape_next = prv_peek_next_letter(curr_pos, bounds_end);
         bool consumed_next = false;
         Codepoint width_cp = prv_shape_pair(prev_cp, curr_cp, shape_next, &consumed_next);
-        word->width_px += prv_codepoint_get_horizontal_advance(&ctx->font_cache,
+        int adv = prv_codepoint_get_horizontal_advance(&ctx->font_cache,
             text_box_params->font, width_cp);
+        if (may_reorder) {
+          adv = prv_mirror_aware_advance(ctx, text_box_params, width_cp, adv);
+        }
+        word->width_px += adv;
         skip_ligature_member = consumed_next;
       }
     }
 
     if (!arabic_is_transparent(curr_cp)) {
       prev_cp = curr_cp;
+    }
+    {
+      // If the iterator skipped formatting codepoints, the last of them is
+      // the real joining predecessor.
+      utf8_t *after_curr = NULL;
+      utf8_peek_codepoint(curr_pos, &after_curr);
+      Codepoint gap_cp = prv_last_raw_cp_between(after_curr, utf8_iter_state->current);
+      if (gap_cp != 0) {
+        prev_cp = gap_cp;
+      }
     }
     curr_cp = next_cp;
     state = word_state_update(state, curr_cp);
@@ -648,6 +710,38 @@ static int prv_shaped_glyph_advance(GContext *ctx, const TextBoxParams *text_box
   return prv_codepoint_get_horizontal_advance(&ctx->font_cache, text_box_params->font, width_cp);
 }
 
+//! Advance for measurement in a paragraph that may reorder: a Bidi_Mirrored
+//! codepoint can be drawn as its mirror, whose advance may differ in a
+//! proportional font (e.g. '<' 9 px vs '>' 10 px in Roboto Condensed 21).
+//! Price the wider of the two so the measured width can never be exceeded by
+//! the drawn width - the residue is at most a hairline gap, never overdraw.
+//! Callers gate this on the paragraph containing RTL, so LTR-only text
+//! prices exactly as before.
+static int prv_mirror_aware_advance(GContext *ctx, const TextBoxParams *text_box_params,
+                                    Codepoint cp, int advance) {
+  Codepoint mirrored = bidi_mirror(cp);
+  if (mirrored == cp) return advance;
+  int m_adv = prv_codepoint_get_horizontal_advance(&ctx->font_cache, text_box_params->font,
+                                                   mirrored);
+  return (m_adv > advance) ? m_adv : advance;
+}
+
+//! True when the paragraph containing pos can reorder (same gate as the bidi
+//! render path), meaning measurement must price mirrored advances.
+static bool prv_paragraph_may_reorder(const TextBoxParams *text_box_params, const utf8_t *pos,
+                                      bool nl_as_space) {
+  if (text_box_params->utf8_bounds == NULL || text_box_params->utf8_bounds->end == NULL ||
+      pos == NULL || text_box_params->utf8_bounds->end <= pos) {
+    return false;
+  }
+  utf8_t *para_start = NULL;
+  utf8_t *para_end = NULL;
+  prv_paragraph_bounds(text_box_params->utf8_bounds->start, text_box_params->utf8_bounds->end,
+                       pos, nl_as_space, &para_start, &para_end);
+  return bidi_contains_rtl(para_start, para_end) ||
+         bidi_base_level_utf8(para_start, para_end) == 1;
+}
+
 //! Call char_visitor_cb on each character in the line
 //! Used to update line dimensions and render characters
 //! Traverse until end of line->width_px if rendering chars, else text_box_params width
@@ -686,303 +780,361 @@ utf8_t* walk_line(GContext* ctx, Line* line, const TextBoxParams* const text_box
     return NULL;
   }
 
-  // RTL support: segment-based rendering for mixed RTL/LTR text
-  // Each RTL segment is reversed individually, LTR segments render normally
-  // For RTL paragraphs, segment order is reversed (BiDi line-level reordering)
+  // RTL support: lines whose paragraph contains RTL characters take the bidi
+  // path during the render pass (measurement shares the standard path below).
   bool is_rendering = (char_visitor_cb == render_chars_char_visitor_cb);
-
-  // For segment-based RTL rendering during render pass
+  bool take_bidi_path = false;
+  utf8_t *para_start = NULL;
+  utf8_t *para_end = NULL;
   if (is_rendering && line->start != NULL && text_box_params->utf8_bounds != NULL &&
       text_box_params->utf8_bounds->end != NULL &&
-      text_box_params->utf8_bounds->end > line->start &&
-      utf8_contains_rtl(line->start, text_box_params->utf8_bounds->end)) {
+      text_box_params->utf8_bounds->end > line->start) {
+    // Gate on the line's whole paragraph: a display line never crosses a
+    // newline, so RTL text in another paragraph must not pull this line
+    // through the (allocating) bidi path - but every line of a paragraph that
+    // contains RTL anywhere must take it, including LTR-only continuation
+    // lines, so their alignment and edge punctuation follow the paragraph
+    // base direction.
+    const bool nl_as_space = (text_box_params->overflow_mode == GTextOverflowModeFill);
+    prv_paragraph_bounds(text_box_params->utf8_bounds->start, text_box_params->utf8_bounds->end,
+                         line->start, nl_as_space, &para_start, &para_end);
+    // A paragraph with strong RTL, or a digit-only paragraph that resolves RTL
+    // (Arabic-Indic numbers): the latter reorders to the identity, but a
+    // truncation suffix still has to land at the visual start.
+    take_bidi_path = bidi_contains_rtl(para_start, para_end) ||
+                     bidi_base_level_utf8(para_start, para_end) == 1;
+  }
+  if (take_bidi_path) {
+    const bool nl_as_space = (text_box_params->overflow_mode == GTextOverflowModeFill);
 
-    // Segment descriptor for BiDi reordering
-    // Headroom for splitting boundary spaces into their own neutral segments.
-    #define MAX_BIDI_SEGMENTS 16
-    typedef struct {
-      utf8_t *start;
-      utf8_t *end;
-      bool is_rtl;
-    } BiDiSegment;
-
-    BiDiSegment segments[MAX_BIDI_SEGMENTS];
-    int num_segments = 0;
-
-    utf8_t *ptr = (utf8_t *)line->start;
+    // Render the line with the bidirectional algorithm: find the logical range
+    // that fits, Arabic-shape it, reorder to visual order and draw left to right.
     utf8_t *line_end = (utf8_t *)text_box_params->utf8_bounds->end;
-    int total_width_px = 0;
 
-    // Pass 1: Collect all segments with their boundaries and directions
-    while (ptr < line_end && *ptr != '\0' && *ptr != '\n' &&
-           total_width_px + suffix_width_px <= available_horiz_px &&
-           num_segments < MAX_BIDI_SEGMENTS) {
-
-      utf8_t *segment_start = ptr;
-      utf8_t *next = NULL;
-      Codepoint first_cp = utf8_peek_codepoint(ptr, &next);
-      if (first_cp == 0 || next == NULL) break;
-
-      // Skip leading punctuation/spaces to determine segment type
-      bool segment_is_rtl = false;
-      utf8_t *check_ptr = ptr;
-      while (check_ptr < line_end && *check_ptr != '\0' && *check_ptr != '\n') {
-        utf8_t *check_next = NULL;
-        Codepoint check_cp = utf8_peek_codepoint(check_ptr, &check_next);
-        if (check_cp == 0 || check_next == NULL) break;
-        if (!prv_codepoint_is_punctuation(check_cp) &&
-            check_cp != SPACE_CODEPOINT && !codepoint_is_zero_width(check_cp)) {
-          segment_is_rtl = codepoint_is_rtl(check_cp);
+    // Walk the logical text accumulating shaped (ligature-folded, mark-aware)
+    // advances - the same arithmetic the measurement pass uses - to find where
+    // this line ends within the available width. Mirrored codepoints are
+    // priced at the wider of the pair (see prv_mirror_aware_advance), so the
+    // drawn line can never exceed the fitted width. Also cap the codepoint count:
+    // the reorder handles at most BIDI_MAX_CODEPOINTS, and zero-width marks
+    // consume codepoints without consuming width, so width alone cannot bound
+    // it; without the cap the tail past the limit would be consumed but never
+    // drawn.
+    int content_width_px = 0;
+    // Reserve one codepoint of reorder capacity for the suffix, which joins
+    // the sequence below so it lands on the correct visual side.
+    const size_t fit_cap = BIDI_MAX_CODEPOINTS - (line->suffix_codepoint ? 1 : 0);
+    size_t fit_cps = 0;
+    // Joining context shared with the standard measurement path and the line
+    // builder: an intraword wrap must measure the same (medial) form it draws.
+    Codepoint prev_cp = prv_joining_context_before(text_box_params, line->start);
+    bool skip_ligature_member = false;
+    utf8_t *fit_end = line->start;
+    utf8_t *last_cp_start = NULL;
+    utf8_t *p = (utf8_t *)line->start;
+    while (p < line_end && *p != '\0' && (nl_as_space || *p != '\n') && fit_cps < fit_cap) {
+      utf8_t *pnext = NULL;
+      Codepoint cp = utf8_peek_codepoint(p, &pnext);
+      if (cp == 0 || pnext == NULL) {
+        break;
+      }
+      if (nl_as_space && cp == '\n') {
+        cp = ' ';  // Fill mode: newline measures and reorders as a space.
+      }
+      fit_cps++;
+      if (prv_codepoint_is_invisible(cp)) {
+        // Formatting codepoints (ZWNJ, directional marks, ...) are not
+        // transparent to joining: the builder and the standard path make them
+        // the previous codepoint, breaking the join, so measurement must too.
+        prev_cp = cp;
+        last_cp_start = p;
+        p = pnext;
+        fit_end = p;
+        continue;
+      }
+      if (skip_ligature_member && !arabic_is_transparent(cp)) {
+        // Alef already counted in the preceding Lam-Alef ligature.
+        skip_ligature_member = false;
+      } else {
+        int glyph_width;
+        if (arabic_is_transparent(cp)) {
+          glyph_width = prv_codepoint_get_horizontal_advance(&ctx->font_cache,
+              text_box_params->font, cp);
+        } else {
+          Codepoint next_cp = prv_peek_next_letter(p, line_end);
+          Codepoint shaped_cp;
+          glyph_width = prv_shaped_glyph_advance(ctx, text_box_params, prev_cp, cp, next_cp,
+                                                 &skip_ligature_member, &shaped_cp);
+          glyph_width = prv_mirror_aware_advance(ctx, text_box_params, shaped_cp, glyph_width);
+        }
+        if (content_width_px + glyph_width + suffix_width_px > available_horiz_px) {
           break;
         }
-        check_ptr = check_next;
+        content_width_px += glyph_width;
       }
+      if (!arabic_is_transparent(cp)) {
+        prev_cp = cp;
+      }
+      last_cp_start = p;
+      p = pnext;
+      fit_end = p;
+    }
 
-      // Collect segment (until we hit opposite script type or end)
-      utf8_t *segment_end = ptr;
-      int segment_width_px = 0;
-      // Track previous codepoint within the segment so Arabic letters are
-      // measured using their contextual presentation form. Without this,
-      // segment width here disagrees with the shaped width used by the
-      // layout (word_init) and by the actual draw pass below — letters at
-      // the line edge get truncated and a gap appears.
-      Codepoint prev_seg_cp = 0;
-      // prv_shape_pair() may combine this codepoint with the next into one
-      // glyph and report the next as consumed; its advance is then already
-      // counted, so skip it on the following iteration.
-      bool skip_ligature_member = false;
-      while (segment_end < line_end && *segment_end != '\0' && *segment_end != '\n') {
-        utf8_t *seg_next = NULL;
-        Codepoint seg_cp = utf8_peek_codepoint(segment_end, &seg_next);
-        if (seg_cp == 0 || seg_next == NULL) break;
+    // If the codepoint cap stopped the scan before the width or the paragraph
+    // did, reordering would silently drop the tail. Fall through to the
+    // standard path instead: complete logical-order text beats truncated
+    // reordered text. (Reaching the cap inside one display line takes
+    // hundreds of codepoints - adversarial, not real notifications.)
+    const bool cap_truncated =
+        (fit_cps >= fit_cap) && p < line_end && *p != '\0' && (nl_as_space || *p != '\n');
 
-        // Skip invisible codepoints (ZWJ, variation selectors, skin tone modifiers)
-        if (prv_codepoint_is_invisible(seg_cp)) {
-          segment_end = seg_next;
-          continue;
+    // Trim trailing spaces like the standard path: they must not consume
+    // width or sit between the content and its suffix. In Fill mode a trailing
+    // newline is a space too. (last_cp_start may point at a trimmed space
+    // afterwards - the trimmed codepoints were visited, and the render-pass
+    // caller discards the return value.)
+    while (fit_end > line->start &&
+           (fit_end[-1] == ' ' || (nl_as_space && fit_end[-1] == '\n'))) {
+      fit_end--;
+    }
+
+    // UAX 9 Basic Display Algorithm: resolve the whole paragraph once, then
+    // apply the per-line rules (L1/L2/L4) to this display line's slice. Weak,
+    // neutral and bracket resolution therefore cross soft wraps exactly as
+    // they would in an unwrapped paragraph. On allocation failure, paragraph
+    // overflow or the codepoint cap, fall through to the standard path so the
+    // line degrades to complete logical-order rendering. The scratch uses
+    // task_malloc(), not applib_malloc(): the latter croaks on a failed
+    // privileged allocation, which would take down a system task instead of
+    // falling back.
+    int walked_width_px = 0;
+    bool bidi_rendered = false;
+    bool suffix_in_visual = false;
+    size_t fit_len = (size_t)(fit_end - line->start);
+    BidiScratch *bidi_ws = NULL;
+    if (!cap_truncated && fit_len > 0) {
+      bidi_ws = task_malloc(sizeof(BidiScratch));
+    }
+    if (bidi_ws) {
+      // Decode the paragraph, tracking where this line's slice begins and
+      // ends. In Fill mode a newline reads as a space. A paragraph beyond the
+      // resolver's capacity falls back to the standard path.
+      size_t para_n = 0;
+      size_t lo = 0, hi = 0;
+      bool para_overflow = false;
+      utf8_t *dp = para_start;
+      while (dp < para_end && *dp != '\0') {
+        if (dp == line->start) lo = para_n;
+        if (dp == fit_end) hi = para_n;
+        utf8_t *dnext = NULL;
+        Codepoint dcp = utf8_peek_codepoint(dp, &dnext);
+        if (dcp == 0 || dnext == NULL) break;
+        if (para_n >= BIDI_MAX_CODEPOINTS) {
+          // More paragraph remains: resolving a truncated prefix would give
+          // early lines wrong context (and mix strategies within one
+          // paragraph), so every line of an over-cap paragraph falls back.
+          para_overflow = true;
+          break;
         }
+        if (nl_as_space && dcp == '\n') dcp = ' ';
+        bidi_ws->cps[para_n++] = dcp;
+        dp = dnext;
+      }
+      if (dp == line->start) lo = para_n;
+      if (dp == fit_end) hi = para_n;
 
-        // Check if this character changes the segment type
-        if (!prv_codepoint_is_punctuation(seg_cp) &&
-            seg_cp != SPACE_CODEPOINT && !codepoint_is_zero_width(seg_cp)) {
-          bool char_is_rtl = codepoint_is_rtl(seg_cp);
-          if (char_is_rtl != segment_is_rtl) {
-            break;  // End of segment
-          }
-        }
+      if (!para_overflow && hi > lo &&
+          (hi - lo) + (line->suffix_codepoint ? 1u : 0u) <= BIDI_MAX_CODEPOINTS) {
+        int base_level = bidi_base_level_utf8(para_start, para_end);
+        bidi_resolve_paragraph(bidi_ws->cps, para_n, base_level, bidi_ws);
 
-        // Trailing spaces are kept in the run here and split out after the loop
-        // (see the trailing-space peel below) so they reorder between runs.
-
-        if (skip_ligature_member && !arabic_is_transparent(seg_cp)) {
-          // Folded into the preceding pair: already counted.
-          skip_ligature_member = false;
-        } else {
-          Codepoint width_cp;
-          if (arabic_is_transparent(seg_cp)) {
-            // A mark keeps its own width but is not reshaped.
-            width_cp = seg_cp;
-          } else {
-            Codepoint next_seg_cp = prv_peek_next_letter(segment_end, line_end);
-            bool consumed_next = false;
-            width_cp = prv_shape_pair(prev_seg_cp, seg_cp, next_seg_cp, &consumed_next);
-            skip_ligature_member = consumed_next;
-          }
-          int glyph_width = prv_codepoint_get_horizontal_advance(&ctx->font_cache,
-              text_box_params->font, width_cp);
-          if (total_width_px + segment_width_px + glyph_width + suffix_width_px > available_horiz_px) {
+        // Build this line's shaped codepoints with their paragraph-resolved
+        // levels, folding pairs exactly like the measurement pass: regional
+        // indicators to one flag, Lam-Alef to one ligature (a pair member
+        // beyond the line end shapes contextually but is not folded away).
+        // Joining context comes from the paragraph, not the slice, so Arabic
+        // forms stay correct across the wrap. Scratch reuse: paragraph state
+        // lives in cps/level; the folded line goes to visual (codepoints) and
+        // type (levels); apply writes visual order over cps, which is no
+        // longer needed by then.
+        Codepoint *const line_cps = bidi_ws->visual;
+        uint8_t *const line_lvl = bidi_ws->type;
+        size_t m = 0;
+        Codepoint prev_sh = 0;
+        for (size_t k = lo; k > 0; k--) {
+          if (!arabic_is_transparent(bidi_ws->cps[k - 1])) {
+            prev_sh = bidi_ws->cps[k - 1];
             break;
           }
-          segment_width_px += glyph_width;
         }
-
-        if (!arabic_is_transparent(seg_cp)) {
-          prev_seg_cp = seg_cp;
-        }
-        segment_end = seg_next;
-      }
-      size_t segment_len = segment_end - segment_start;
-      if (segment_len == 0) break;
-
-      // Peel trailing spaces into their own neutral segment. A space between
-      // two runs is direction-neutral: if it stays inside a run it is reversed
-      // with that run and the segment reorder then carries it to the run's far
-      // edge, so the gap separating the two runs collapses. As its own segment
-      // it stays put between the runs it separates.
-      utf8_t *content_end = rtl_segment_content_end(segment_start, segment_end);
-
-      if (content_end > segment_start && content_end < segment_end) {
-        // strong-direction content, then the trailing space(s) as a neutral
-        segments[num_segments++] = (BiDiSegment){
-          .start = segment_start, .end = content_end, .is_rtl = segment_is_rtl,
-        };
-        if (num_segments < MAX_BIDI_SEGMENTS) {
-          segments[num_segments++] = (BiDiSegment){
-            .start = content_end, .end = segment_end, .is_rtl = false,
-          };
-        }
-      } else {
-        segments[num_segments++] = (BiDiSegment){
-          .start = segment_start, .end = segment_end, .is_rtl = segment_is_rtl,
-        };
-      }
-      total_width_px += segment_width_px;
-      ptr = segment_end;
-    }
-
-    // Pass 2: Reorder segments for RTL paragraph direction
-    // When the line starts with RTL text, the visual order of segments must be
-    // reversed so the first logical segment appears on the right (reading start)
-    bool line_is_rtl = prv_utf8_starts_with_rtl(line->start, text_box_params->utf8_bounds->end);
-    if (line_is_rtl && num_segments > 1) {
-      for (int i = 0; i < num_segments / 2; i++) {
-        BiDiSegment temp = segments[i];
-        segments[i] = segments[num_segments - 1 - i];
-        segments[num_segments - 1 - i] = temp;
-      }
-    }
-
-    // Pass 3: Render segments in (possibly reordered) visual order
-    int walked_width_px = 0;
-    utf8_t *last_visited_char = NULL;
-    utf8_t rtl_buffer[128];
-    const size_t rtl_buffer_size = sizeof(rtl_buffer);
-
-    for (int seg_idx = 0; seg_idx < num_segments; seg_idx++) {
-      BiDiSegment *seg = &segments[seg_idx];
-      size_t seg_len = seg->end - seg->start;
-
-      if (seg->is_rtl) {
-        // Shape, reverse, render. Buffers sized to fit any single line on
-        // 200-260 px displays; shaping expands Arabic basic-block (2 UTF-8
-        // bytes) to presentation forms (3 bytes).
-        size_t render_len = seg_len;
-        size_t reversed_len = 0;
-
-        if (render_len > rtl_buffer_size - 4) {
-          render_len = rtl_buffer_size - 4;
-        }
-
-        if (utf8_contains_arabic(seg->start, seg->end)) {
-          utf8_t *shaped_buffer = applib_malloc(rtl_buffer_size);
-          if (shaped_buffer) {
-            size_t shaped_len = arabic_shape_text(seg->start, render_len,
-                                                  shaped_buffer, rtl_buffer_size - 1);
-            if (shaped_len > 0) {
-              shaped_buffer[shaped_len] = '\0';
-              reversed_len = utf8_reverse_for_rtl(shaped_buffer, shaped_len,
-                                                  rtl_buffer, rtl_buffer_size - 1);
+        size_t k = lo;
+        while (k < hi) {
+          Codepoint cur = bidi_ws->cps[k];
+          Codepoint nxt = 0;
+          size_t nxt_idx = para_n;
+          for (size_t j = k + 1; j < para_n; j++) {
+            if (!arabic_is_transparent(bidi_ws->cps[j])) {
+              nxt = bidi_ws->cps[j];
+              nxt_idx = j;
+              break;
             }
-            applib_free(shaped_buffer);
           }
-        }
-
-        if (reversed_len == 0) {
-          reversed_len = utf8_reverse_for_rtl(seg->start, render_len,
-                                              rtl_buffer, rtl_buffer_size - 1);
-        }
-
-        if (reversed_len > 0) {
-          rtl_buffer[reversed_len] = '\0';
-
-          utf8_t *rptr = rtl_buffer;
-          while (*rptr != '\0') {
-            utf8_t *rnext = NULL;
-            Codepoint rcp = utf8_peek_codepoint(rptr, &rnext);
-            if (rcp == 0 || rnext == NULL) break;
-            if (prv_codepoint_is_invisible(rcp)) { rptr = rnext; continue; }
-
-            int glyph_width = prv_codepoint_get_horizontal_advance(&ctx->font_cache,
-                text_box_params->font, rcp);
-
-            GRect cursor = {
-              .origin = line->origin,
-              .size.w = glyph_width,
-              .size.h = fonts_get_font_height(text_box_params->font)
-            };
-            cursor.origin.x += walked_width_px;
-
-            if (!codepoint_is_zero_width(rcp)) {
-              text_resources_get_glyph(&ctx->font_cache, rcp, text_box_params->font, NULL);
-              render_glyph(ctx, rcp, text_box_params->font, cursor);
-            }
-
-            walked_width_px += glyph_width;
-            rptr = rnext;
-          }
-        }
-      } else {
-        // LTR segment: render folding pairs exactly like the pass-1 width
-        // measurement above, so both passes agree on what gets drawn.
-        utf8_t *sptr = seg->start;
-        Codepoint prev_seg_cp = 0;
-        bool skip_pair_member = false;
-        while (sptr < seg->end) {
-          utf8_t *snext = NULL;
-          Codepoint scp = utf8_peek_codepoint(sptr, &snext);
-          if (scp == 0 || snext == NULL) break;
-          if (prv_codepoint_is_invisible(scp)) { sptr = snext; continue; }
-
-          if (skip_pair_member && !arabic_is_transparent(scp)) {
-            // Folded into the preceding pair: already drawn, adds no width.
-            skip_pair_member = false;
+          bool consumed = false;
+          Codepoint sh;
+          if (codepoint_is_regional_indicator(cur)) {
+            sh = FLAG_CODEPOINT;
+            consumed = (nxt_idx < hi) && codepoint_is_regional_indicator(nxt);
+          } else if (arabic_is_transparent(cur)) {
+            sh = cur;  // a mark keeps its own glyph
           } else {
-            Codepoint draw_cp;
-            if (arabic_is_transparent(scp)) {
-              // A mark keeps its own width and glyph.
-              draw_cp = scp;
-            } else {
-              Codepoint next_seg_cp = prv_peek_next_letter(sptr, seg->end);
-              bool consumed_next = false;
-              draw_cp = prv_shape_pair(prev_seg_cp, scp, next_seg_cp, &consumed_next);
-              skip_pair_member = consumed_next;
+            sh = arabic_shape_pair(prev_sh, cur, nxt, &consumed);
+            if (consumed && nxt_idx >= hi) {
+              // Pair partner is on the next line: shape contextually, no fold.
+              consumed = false;
+              sh = arabic_shape_codepoint(prev_sh, cur, nxt);
             }
+          }
+          line_cps[m] = sh;
+          line_lvl[m] = bidi_ws->level[k];
+          m++;
+          if (consumed) {
+            // Emit any marks sitting between the pair, then skip the partner.
+            // The joining predecessor for the next letter is the consumed
+            // partner (the Alef, which does not connect forward) - not the
+            // Lam - matching what the fitting pass and arabic_shape_text()
+            // see when they walk every codepoint.
+            for (size_t j = k + 1; j < nxt_idx; j++) {
+              line_cps[m] = bidi_ws->cps[j];
+              line_lvl[m] = bidi_ws->level[j];
+              m++;
+            }
+            prev_sh = nxt;
+            k = nxt_idx + 1;
+          } else {
+            if (!arabic_is_transparent(cur)) {
+              prev_sh = cur;
+            }
+            k++;
+          }
+        }
+        // The suffix is logically after the truncated content; at the base
+        // level it lands at the visual end of the reading direction (the left
+        // edge of an RTL line).
+        if (line->suffix_codepoint && m < BIDI_MAX_CODEPOINTS) {
+          line_cps[m] = line->suffix_codepoint;
+          line_lvl[m] = (uint8_t)base_level;
+          m++;
+          suffix_in_visual = true;
+        }
 
+        size_t n_vis = bidi_apply_line(line_cps, line_lvl, m, base_level, bidi_ws->cps, bidi_ws);
+        if (n_vis > 0) {
+          bidi_rendered = true;
+          // The measured line width prices mirrored codepoints conservatively
+          // (wider of the pair), so the drawn run can be narrower. Compute the
+          // exact drawn width and place the run flush per the effective
+          // alignment - alignment error then cannot accumulate, whatever the
+          // pricing policy.
+          int drawn_w = 0;
+          for (size_t v = 0; v < n_vis; v++) {
+            Codepoint vcp = bidi_ws->cps[v];
+            if (prv_codepoint_is_invisible(vcp)) continue;
+            drawn_w += prv_codepoint_get_horizontal_advance(&ctx->font_cache,
+                text_box_params->font, vcp);
+          }
+          GTextAlignment eff_align = text_box_params->alignment;
+          if (eff_align == GTextAlignmentLeft && base_level == 1) {
+            eff_align = GTextAlignmentRight;  // same rule as prv_line_justify()
+          }
+          int pen_shift = 0;
+          const int width_delta = (int)line->width_px - drawn_w;
+          if (width_delta > 0) {
+            if (eff_align == GTextAlignmentRight) pen_shift = width_delta;
+            else if (eff_align == GTextAlignmentCenter) pen_shift = width_delta / 2;
+          }
+          walked_width_px = pen_shift;
+          // Pen position of the last full-advance glyph, for anchoring the
+          // zero-advance combining marks that follow it.
+          int base_x = pen_shift;
+          int base_adv = 0;
+          for (size_t v = 0; v < n_vis; v++) {
+            Codepoint vcp = bidi_ws->cps[v];
+            if (prv_codepoint_is_invisible(vcp)) {
+              continue;
+            }
             int glyph_width = prv_codepoint_get_horizontal_advance(&ctx->font_cache,
-                text_box_params->font, draw_cp);
-
+                text_box_params->font, vcp);
             GRect cursor = {
               .origin = line->origin,
               .size.w = glyph_width,
-              .size.h = fonts_get_font_height(text_box_params->font)
+              .size.h = fonts_get_font_height(text_box_params->font),
             };
             cursor.origin.x += walked_width_px;
-
-            if (!codepoint_is_zero_width(draw_cp)) {
-              text_resources_get_glyph(&ctx->font_cache, draw_cp, text_box_params->font, NULL);
-              render_glyph(ctx, draw_cp, text_box_params->font, cursor);
+            if (!codepoint_is_zero_width(vcp) && !codepoint_is_unicode_space(vcp)) {
+              const GlyphData *glyph =
+                  text_resources_get_glyph(&ctx->font_cache, vcp, text_box_params->font, NULL);
+              if (glyph_width == 0 && glyph != NULL) {
+                // A zero-advance combining mark: anchor it on its base. The
+                // shipped fonts carry both pen conventions (mark drawn from
+                // the base's own pen, or from the pen after its advance), and
+                // bearing sign alone does not discriminate them - so place
+                // the mark at whichever pen lands more of its bitmap on the
+                // base's cell.
+                const int m_left = glyph->header.left_offset_px;
+                const int m_w = glyph->header.width_px;
+                int best_pen = base_x;
+                int best_overlap = -1;
+                const int pens[2] = { base_x, base_x + base_adv };
+                for (int pi = 0; pi < 2; pi++) {
+                  int span_lo = pens[pi] + m_left;
+                  int span_hi = span_lo + m_w;
+                  int o_lo = (span_lo > base_x) ? span_lo : base_x;
+                  int o_hi = (span_hi < base_x + base_adv) ? span_hi : base_x + base_adv;
+                  int overlap = (o_hi > o_lo) ? (o_hi - o_lo) : 0;
+                  if (overlap > best_overlap) {
+                    best_overlap = overlap;
+                    best_pen = pens[pi];
+                  }
+                }
+                cursor.origin.x = line->origin.x + best_pen;
+              }
+              render_glyph(ctx, vcp, text_box_params->font, cursor);
             }
-
+            if (glyph_width > 0) {
+              base_x = walked_width_px;
+              base_adv = glyph_width;
+            }
             walked_width_px += glyph_width;
           }
-
-          if (!arabic_is_transparent(scp)) {
-            prev_seg_cp = scp;
-          }
-          sptr = snext;
         }
       }
+      task_free(bidi_ws);
+    } else if (!cap_truncated && fit_len == 0) {
+      bidi_rendered = true;  // nothing fits: nothing to draw beyond the suffix
+    }
+    // Any other way here (cap, paragraph overflow, allocation failure) falls
+    // through to the standard logical-order path below.
 
-      // Track last visited char (furthest position in original text)
-      if (last_visited_char == NULL || seg->start > last_visited_char) {
-        last_visited_char = seg->start;
+    if (bidi_rendered) {
+      // Suffix not reordered with the content (empty line): draw it after.
+      if (line->suffix_codepoint && !suffix_in_visual) {
+        GRect cursor = {
+          .origin = line->origin,
+          .size.w = suffix_width_px,
+          .size.h = fonts_get_font_height(text_box_params->font),
+        };
+        cursor.origin.x += walked_width_px;
+        text_resources_get_glyph(&ctx->font_cache, line->suffix_codepoint, text_box_params->font,
+                                 NULL);
+        render_glyph(ctx, line->suffix_codepoint, text_box_params->font, cursor);
       }
-    }
 
-    // Handle suffix if present
-    if (line->suffix_codepoint) {
-      GRect cursor = {
-        .origin = line->origin,
-        .size.w = suffix_width_px,
-        .size.h = fonts_get_font_height(text_box_params->font)
-      };
-      cursor.origin.x += walked_width_px;
-      text_resources_get_glyph(&ctx->font_cache, line->suffix_codepoint, text_box_params->font,
-                               NULL);
-      render_glyph(ctx, line->suffix_codepoint, text_box_params->font, cursor);
+      // Per the function contract: the start of the last visited codepoint,
+      // or NULL when nothing fit on the line.
+      return last_cp_start;
     }
-
-    return last_visited_char;
+    // Bidi render did not run: continue into the standard path (which draws
+    // the suffix itself).
   }
 
   // Standard rendering path (no RTL or not rendering)
@@ -1005,7 +1157,15 @@ utf8_t* walk_line(GContext* ctx, Line* line, const TextBoxParams* const text_box
       (text_box_params->utf8_bounds != NULL) ? text_box_params->utf8_bounds->end : NULL;
 
   int walked_width_px = 0;
-  Codepoint prev_shaped_cp = 0;       // previous codepoint, for Arabic joining context
+  // Arabic joining context from the text before this line, matching the bidi
+  // fit scan and line builder, so layout and render always agree on forms.
+  Codepoint prev_shaped_cp = prv_joining_context_before(text_box_params, line->start);
+  // One advance policy everywhere: in a paragraph that can reorder, price
+  // mirrored codepoints at the wider advance here too, or the hyphenation
+  // split consumes a codepoint the render fit cannot fit (it is then drawn on
+  // neither line).
+  const bool std_may_reorder = prv_paragraph_may_reorder(text_box_params, line->start,
+      text_box_params->overflow_mode == GTextOverflowModeFill);
   bool skip_ligature_member = false;  // current codepoint was folded into a preceding pair
   bool consumed_next = false;
   bool current_folded = false;        // current codepoint was folded into the preceding pair
@@ -1013,6 +1173,10 @@ utf8_t* walk_line(GContext* ctx, Line* line, const TextBoxParams* const text_box
   Codepoint peek_cp = prv_peek_next_letter(utf8_iter_state->current, text_end);
   int next_glyph_width_px = prv_shaped_glyph_advance(ctx, text_box_params, prev_shaped_cp,
       current_codepoint, peek_cp, &consumed_next, &current_draw_cp);
+  if (std_may_reorder) {
+    next_glyph_width_px = prv_mirror_aware_advance(ctx, text_box_params, current_draw_cp,
+                                                   next_glyph_width_px);
+  }
 
   utf8_t* last_visited_char = NULL;
 
@@ -1050,8 +1214,18 @@ utf8_t* walk_line(GContext* ctx, Line* line, const TextBoxParams* const text_box
       prev_shaped_cp = current_codepoint;
     }
 
+    utf8_t *pos_before_advance = utf8_iter_state->current;
     if (!iter_next(&char_iter)) {
       break;
+    }
+    {
+      // Formatting codepoints the iterator skipped still break the join.
+      utf8_t *after_prev = NULL;
+      utf8_peek_codepoint(pos_before_advance, &after_prev);
+      Codepoint gap_cp = prv_last_raw_cp_between(after_prev, utf8_iter_state->current);
+      if (gap_cp != 0) {
+        prev_shaped_cp = gap_cp;
+      }
     }
 
     current_codepoint = utf8_iter_state->codepoint;
@@ -1079,6 +1253,10 @@ utf8_t* walk_line(GContext* ctx, Line* line, const TextBoxParams* const text_box
       peek_cp = prv_peek_next_letter(utf8_iter_state->current, text_end);
       next_glyph_width_px = prv_shaped_glyph_advance(ctx, text_box_params, prev_shaped_cp,
           current_codepoint, peek_cp, &consumed_next, &current_draw_cp);
+      if (std_may_reorder) {
+        next_glyph_width_px = prv_mirror_aware_advance(ctx, text_box_params, current_draw_cp,
+                                                       next_glyph_width_px);
+      }
     }
   }
 
@@ -1434,6 +1612,20 @@ bool line_add_word(GContext* ctx, Line* line, Word* word, const TextBoxParams* c
     PBL_ASSERTN(word->width_px >= truncated_word_length_px);
     word->width_px -= truncated_word_length_px;
     word->start = utf8_get_next(last_visited);
+    // Never start a continuation line on a filtered formatting codepoint
+    // (ZWNJ, directional marks): the iterator never yields them, but the
+    // standard measurement path takes a line's first codepoint raw and would
+    // price it as a visible wildcard glyph, splitting layout and render
+    // accounting. They remain in the raw text, so the joining-context scans
+    // still see them break the join.
+    while (word->start != NULL) {
+      utf8_t *skip_next = NULL;
+      Codepoint skip_cp = utf8_peek_codepoint(word->start, &skip_next);
+      if (skip_cp == 0 || skip_next == NULL || !prv_codepoint_is_invisible(skip_cp)) {
+        break;
+      }
+      word->start = skip_next;
+    }
 
     return false;
   }
@@ -1458,9 +1650,20 @@ static void prv_line_justify(Line* line, const TextBoxParams* const text_box_par
   // Determine effective alignment - RTL text defaults to right alignment
   GTextAlignment effective_alignment = text_box_params->alignment;
 
-  // If alignment is left (default) and text starts with RTL, switch to right
-  if (effective_alignment == GTextAlignmentLeft && line->start != NULL) {
-    if (prv_utf8_starts_with_rtl(line->start, text_box_params->utf8_bounds->end)) {
+  // If alignment is left (default) and the paragraph base direction is RTL,
+  // switch to right. Scan the line's whole paragraph with the same base-level
+  // rule as the bidi render path, so every wrapped line of an RTL paragraph
+  // aligns the same way (including a digit-only Arabic-Indic paragraph, which
+  // the renderer also gates into the bidi path so a suffix reorders left).
+  if (effective_alignment == GTextAlignmentLeft && line->start != NULL &&
+      text_box_params->utf8_bounds != NULL && text_box_params->utf8_bounds->end != NULL &&
+      text_box_params->utf8_bounds->end > line->start) {
+    utf8_t *para_start = NULL;
+    utf8_t *para_end = NULL;
+    const bool nl_as_space = (text_box_params->overflow_mode == GTextOverflowModeFill);
+    prv_paragraph_bounds(text_box_params->utf8_bounds->start, text_box_params->utf8_bounds->end,
+                         line->start, nl_as_space, &para_start, &para_end);
+    if (bidi_base_level_utf8(para_start, para_end) == 1) {
       effective_alignment = GTextAlignmentRight;
     }
   }

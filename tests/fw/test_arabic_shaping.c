@@ -20,7 +20,8 @@
 // Shape `in`, decode the result into `cps`, return the codepoint count.
 static size_t prv_shape(const char *in, Codepoint *cps, size_t max) {
   utf8_t out[128];
-  size_t len = arabic_shape_text((const utf8_t *)in, strlen(in), out, sizeof(out) - 1);
+  static Codepoint cp_scratch[MAX_SHAPE_CODEPOINTS];
+  size_t len = arabic_shape_text((const utf8_t *)in, strlen(in), out, sizeof(out) - 1, cp_scratch);
   out[len] = '\0';
   size_t count = 0;
   utf8_t *ptr = out;

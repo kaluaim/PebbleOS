@@ -43,22 +43,21 @@ clar(ctx,
     test_sources_ant_glob = "test_codepoint.c")
 
 clar(ctx,
-    sources_ant_glob = "src/fw/applib/graphics/rtl_support.c" \
-        " src/fw/applib/graphics/utf8.c" \
-        " src/fw/applib/fonts/codepoint.c",
-    test_sources_ant_glob = "test_rtl_support.c")
-
-clar(ctx,
     sources_ant_glob = "src/fw/applib/graphics/arabic_shaping.c" \
         " src/fw/applib/graphics/utf8.c",
     test_sources_ant_glob = "test_arabic_shaping.c")
+
+clar(ctx,
+    sources_ant_glob = "src/fw/applib/graphics/bidi.c" \
+        " src/fw/applib/graphics/utf8.c",
+    test_sources_ant_glob = "test_bidi.c")
 
 clar(ctx,
     sources_ant_glob = "src/fw/applib/graphics/utf8.c" \
         " src/fw/applib/graphics/framebuffer.c" \
         " src/fw/applib/graphics/gtypes.c" \
         " src/fw/applib/graphics/text_layout.c" \
-        " src/fw/applib/graphics/rtl_support.c" \
+        " src/fw/applib/graphics/bidi.c" \
         " src/fw/applib/graphics/arabic_shaping.c" \
         " src/fw/applib/fonts/codepoint.c" \
         " tests/fakes/fake_gbitmap_png.c",
@@ -69,7 +68,7 @@ clar(ctx,
         " src/fw/applib/graphics/framebuffer.c" \
         " src/fw/applib/graphics/gtypes.c" \
         " src/fw/applib/graphics/text_layout.c" \
-        " src/fw/applib/graphics/rtl_support.c" \
+        " src/fw/applib/graphics/bidi.c" \
         " src/fw/applib/graphics/arabic_shaping.c" \
         " src/fw/applib/fonts/codepoint.c" \
         " tests/fakes/fake_gbitmap_png.c",
@@ -88,7 +87,7 @@ clar(ctx,
         " src/fw/applib/graphics/framebuffer.c" \
         " src/fw/applib/graphics/gtypes.c" \
         " src/fw/applib/graphics/text_layout.c" \
-        " src/fw/applib/graphics/rtl_support.c" \
+        " src/fw/applib/graphics/bidi.c" \
         " src/fw/applib/graphics/arabic_shaping.c" \
         " src/fw/applib/fonts/codepoint.c" \
         " tests/fakes/fake_gbitmap_png.c",
@@ -308,7 +307,7 @@ templated_sources_ant_glob = \
     " src/fw/applib/graphics/bitblt.c" \
     " src/fw/applib/graphics/{depth_dir}/bitblt_private.c" \
     " src/fw/applib/graphics/text_layout.c" \
-    " src/fw/applib/graphics/rtl_support.c" \
+    " src/fw/applib/graphics/bidi.c" \
     " src/fw/applib/graphics/arabic_shaping.c" \
     " tests/fakes/fake_gbitmap_png.c" \
     " src/fw/applib/fonts/codepoint.c" \

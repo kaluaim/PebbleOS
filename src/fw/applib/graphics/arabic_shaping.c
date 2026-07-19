@@ -5,10 +5,6 @@
 
 #include <string.h>
 
-// Caps codepoints per shaping call. Sized to match walk_line's 128-byte
-// shape buffer (~64 Arabic codepoints at 2 UTF-8 bytes each).
-#define MAX_SHAPE_CODEPOINTS 64
-
 // Connectivity flags for Arabic letters
 #define JOIN_NONE       0x00  // Does not connect (space, punctuation)
 #define JOIN_RIGHT_ONLY 0x01  // Connects only to the right (non-connecting letters)
@@ -304,13 +300,13 @@ bool arabic_is_transparent(Codepoint cp) {
 }
 
 size_t arabic_shape_text(const utf8_t *src, size_t src_len,
-                         utf8_t *dest, size_t dest_size) {
-  if (src == NULL || dest == NULL || src_len == 0 || dest_size == 0) {
+                         utf8_t *dest, size_t dest_size, Codepoint *cp_scratch) {
+  if (src == NULL || dest == NULL || cp_scratch == NULL || src_len == 0 || dest_size == 0) {
     return 0;
   }
 
-  // First pass: collect all codepoints into an array
-  Codepoint codepoints[MAX_SHAPE_CODEPOINTS];
+  // First pass: collect all codepoints into the caller's scratch array
+  Codepoint *codepoints = cp_scratch;
   size_t num_codepoints = 0;
 
   utf8_t *ptr = (utf8_t *)src;
@@ -355,7 +351,9 @@ size_t arabic_shape_text(const utf8_t *src, size_t src_len,
       }
     }
 
-    // Lam-Alef collapses two letters into one ligature glyph.
+    // Lam-Alef collapses two letters into one ligature glyph. Emoji pairs are
+    // NOT folded here: regional indicators must reach the bidi engine as their
+    // UCD class L, so the draw pass folds them after reordering.
     bool consumed_next = false;
     Codepoint shaped_cp = arabic_shape_pair(prev_cp, curr_cp, next_cp, &consumed_next);
 

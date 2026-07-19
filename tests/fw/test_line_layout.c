@@ -498,3 +498,40 @@ void test_line_layout__test_walk_lines_down(void) {
   }
 }
 
+
+// A hyphen-split continuation must not start on a filtered formatting
+// codepoint: ZWNJ between letters stays in the raw text (it breaks the join)
+// but the next line begins on the letter after it. Before the fix, the
+// continuation pointer stayed on the ZWNJ, the standard path priced it as a
+// visible wildcard, and the final letter of the word was consumed but never
+// drawn. Word: Beh ZWNJ Beh Beh Beh in a two-advance box.
+void test_line_layout__continuation_skips_formatting_codepoint(void) {
+  Iterator word_iter = ITERATOR_EMPTY;
+  WordIterState word_iter_state = WORD_ITER_STATE_EMPTY;
+  Line line = { 0 };
+
+  bool success = false;
+  const Utf8Bounds utf8_bounds =
+      utf8_get_bounds(&success, "\xD8\xA8\xE2\x80\x8C\xD8\xA8\xD8\xA8\xD8\xA8");
+  cl_assert(success);
+
+  const TextBoxParams text_box_params = (TextBoxParams) {
+    .utf8_bounds = &utf8_bounds,
+    .box = (GRect) { GPointZero, (GSize) { 2 * HORIZ_ADVANCE_PX + 1, 22 } }
+  };
+  line.max_width_px = text_box_params.box.size.w;
+  line.height_px = text_box_params.box.size.h;
+
+  word_iter_init(&word_iter, &word_iter_state, &s_ctx, &text_box_params, utf8_bounds.start);
+
+  // First display line: hyphen split; the continuation starts on the second
+  // Beh (byte offset 5), past the ZWNJ at offset 2.
+  line_reset(&line, (utf8_t *)utf8_bounds.start);
+  cl_assert(!line_add_word(&s_ctx, &line, &word_iter_state.current, &text_box_params));
+  cl_assert_equal_i((int)(word_iter_state.current.start - utf8_bounds.start), 5);
+
+  // Second display line: the split advances again, to the third Beh.
+  line_reset(&line, word_iter_state.current.start);
+  cl_assert(!line_add_word(&s_ctx, &line, &word_iter_state.current, &text_box_params));
+  cl_assert_equal_i((int)(word_iter_state.current.start - utf8_bounds.start), 7);
+}
