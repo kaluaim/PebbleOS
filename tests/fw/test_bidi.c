@@ -143,6 +143,16 @@ void test_bidi__date_groups_in_order(void) {
   prv_assert_eq(out, in, 10);
 }
 
+// WORD JOINER is a boundary neutral, so W4 still sees the digits on both
+// sides of the decimal separator.
+void test_bidi__word_joiner_does_not_split_number(void) {
+  Codepoint out[8];
+  const Codepoint in[] = {0x05D0, '1', '.', 0x2060, '1', '1'};
+  const Codepoint want[] = {'1', '.', 0x2060, '1', '1', 0x05D0};
+  prv_visual(in, 6, 1, out);
+  prv_assert_eq(out, want, 6);
+}
+
 // A separator only joins a number with a digit on both sides. Here "/" has a
 // letter on one side, so it reorders as a neutral: ا/٢ -> visual ٢ / ا.
 void test_bidi__separator_needs_two_digits(void) {

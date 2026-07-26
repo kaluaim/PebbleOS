@@ -83,9 +83,10 @@ static BidiClass prv_class(Codepoint cp) {
   // Zero-width and other boundary neutrals. The isolate controls (FSI/RLI/
   // LRI/PDI) are unimplemented; treating them as transparent BN is closer to
   // ignoring them than letting them join neutral runs as ON.
-  if (cp == 0x200B || cp == 0x200C || cp == 0x200D || cp == 0xFEFF ||
-      prv_in(cp, 0x2066, 0x2069) || prv_in(cp, 0x202A, 0x202E) ||
-      prv_in(cp, 0x0000, 0x0008) || prv_in(cp, 0x000E, 0x001B)) return BN;
+  if (cp == 0x200B || cp == 0x200C || cp == 0x200D || cp == 0xFEFF || prv_in(cp, 0x2060, 0x206F) ||
+      prv_in(cp, 0x202A, 0x202E) || prv_in(cp, 0x0000, 0x0008) || prv_in(cp, 0x000E, 0x001B) ||
+      cp == 0x007F || prv_in(cp, 0x0080, 0x0084) || prv_in(cp, 0x0086, 0x009F))
+    return BN;
 
   // Strong RTL: Hebrew including presentation forms, and NKo (R); Arabic
   // including supplements and presentation forms (AL).
