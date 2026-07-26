@@ -38,15 +38,23 @@
 
 static GContext s_ctx;
 static FrameBuffer s_fb;
+static Codepoint s_rendered_codepoints[16];
+static size_t s_rendered_count;
 
 size_t framebuffer_get_size_bytes(FrameBuffer *f) {
   return FRAMEBUFFER_SIZE_BYTES;
 }
 
+void render_all_render_line_cb(GContext *ctx, Line *line,
+                               const TextBoxParams *const text_box_params);
+
 ///////////////////////////////////////////////////////////
 // Tests
 
 void test_line_layout__initialize(void) {
+  s_text_resources_horiz_advance_override = NULL;
+  s_render_glyph_callback = NULL;
+  s_rendered_count = 0;
   framebuffer_init(&s_fb, &(GSize) {DISP_COLS, DISP_ROWS});
   graphics_context_init(&s_ctx, &s_fb, GContextInitializationMode_App);
 }
@@ -57,6 +65,55 @@ void line_reset(Line* line, utf8_t* start) {
   line->height_px = 0;
   line->width_px = 0;
   line->suffix_codepoint = 0;
+  line->bidi_text_end = NULL;
+}
+
+static int8_t prv_asymmetric_mirror_advance(Codepoint codepoint) {
+  switch (codepoint) {
+    case '>':
+      return 10;
+    case '<':
+      return 9;
+    case '-':
+      return 5;
+    default:
+      return -1;
+  }
+}
+
+static void prv_capture_rendered_codepoint(uint32_t codepoint, GRect cursor) {
+  cl_assert(s_rendered_count < (sizeof(s_rendered_codepoints) / sizeof(s_rendered_codepoints[0])));
+  s_rendered_codepoints[s_rendered_count++] = codepoint;
+}
+
+void test_line_layout__exact_mirrored_run_stays_on_one_line(void) {
+  Iterator word_iter = ITERATOR_EMPTY;
+  WordIterState word_iter_state = WORD_ITER_STATE_EMPTY;
+  Line line = {0};
+
+  bool success = false;
+  const Utf8Bounds utf8_bounds =
+      utf8_get_bounds(&success, "\xE2\x80\x8F>>>>>>>>>>");  // RLM + ten greater-than signs
+  cl_assert(success);
+
+  const TextBoxParams text_box_params =
+      (TextBoxParams){.utf8_bounds = &utf8_bounds, .box = (GRect){GPointZero, (GSize){99, 11}}};
+  line.max_width_px = text_box_params.box.size.w;
+  line.height_px = text_box_params.box.size.h;
+  s_text_resources_horiz_advance_override = prv_asymmetric_mirror_advance;
+
+  word_iter_init(&word_iter, &word_iter_state, &s_ctx, &text_box_params, utf8_bounds.start);
+
+  cl_assert(!line_add_words(&line, &word_iter, NULL));
+  cl_assert_equal_i(line.width_px, 90);
+  cl_assert_equal_i(line.suffix_codepoint, 0);
+
+  s_render_glyph_callback = prv_capture_rendered_codepoint;
+  render_all_render_line_cb(&s_ctx, &line, &text_box_params);
+  cl_assert_equal_i(s_rendered_count, 10);
+  for (size_t i = 0; i < s_rendered_count; i++) {
+    cl_assert_equal_i(s_rendered_codepoints[i], '<');
+  }
 }
 
 // The line-width (measurement) pass must count a Lam-Alef ligature as one glyph,

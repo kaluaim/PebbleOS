@@ -10,6 +10,10 @@
 #include <stdbool.h>
 #include <inttypes.h>
 
-void render_glyph(GContext* ctx, uint32_t codepoint, FontInfo* font, GRect cursor) {
-}
+static void (*s_render_glyph_callback)(uint32_t codepoint, GRect cursor);
 
+void render_glyph(GContext* ctx, uint32_t codepoint, FontInfo* font, GRect cursor) {
+  if (s_render_glyph_callback) {
+    s_render_glyph_callback(codepoint, cursor);
+  }
+}

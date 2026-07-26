@@ -30,6 +30,7 @@ typedef struct {
   int16_t width_px;
   int16_t max_width_px; //<! Maximum length of the line
   Codepoint suffix_codepoint;
+  utf8_t *bidi_text_end;  //<! Exclusive end of an exact bidi fit
 } Line;
 
 //! Definition of a word:
@@ -117,4 +118,3 @@ typedef struct {
 } WalkLinesCallbacks;
 
 #define WALK_LINE_CALLBACKS_EMPTY ((WalkLinesCallbacks){ 0, 0, 0, 0 })
-

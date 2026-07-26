@@ -498,6 +498,7 @@ bool line_iter_next(IteratorState state) {
   line_iter_state->current->width_px = 0;  // needs to be reset per line
   line_iter_state->current->max_width_px = text_box_params->box.size.w;
   line_iter_state->current->suffix_codepoint = 0;
+  line_iter_state->current->bidi_text_end = NULL;
   line_iter_state->current->start = NULL;
 
   return true;
@@ -742,6 +743,181 @@ static bool prv_paragraph_may_reorder(const TextBoxParams *text_box_params, cons
          bidi_base_level_utf8(para_start, para_end) == 1;
 }
 
+typedef struct {
+  size_t count;
+  int width_px;
+  int base_level;
+  bool suffix_in_visual;
+} BidiVisualLine;
+
+// Resolve the paragraph and build one shaped, reordered display-line slice.
+static bool prv_build_bidi_visual_line(GContext *ctx, const TextBoxParams *text_box_params,
+                                       utf8_t *para_start, utf8_t *para_end, utf8_t *line_start,
+                                       utf8_t *line_end, Codepoint suffix_codepoint,
+                                       BidiScratch *ws, BidiVisualLine *result) {
+  if (line_start == NULL || line_end == NULL || line_start > line_end || line_start < para_start ||
+      line_end > para_end) {
+    return false;
+  }
+
+  size_t para_n = 0;
+  size_t lo = 0;
+  size_t hi = 0;
+  bool found_lo = false;
+  bool found_hi = false;
+  const bool nl_as_space = (text_box_params->overflow_mode == GTextOverflowModeFill);
+  utf8_t *dp = para_start;
+  while (dp < para_end && *dp != '\0') {
+    if (dp == line_start) {
+      lo = para_n;
+      found_lo = true;
+    }
+    if (dp == line_end) {
+      hi = para_n;
+      found_hi = true;
+    }
+
+    utf8_t *dnext = NULL;
+    Codepoint dcp = utf8_peek_codepoint(dp, &dnext);
+    if (dcp == 0 || dnext == NULL || para_n >= BIDI_MAX_CODEPOINTS) {
+      return false;
+    }
+    if (nl_as_space && dcp == '\n') {
+      dcp = ' ';
+    }
+    ws->cps[para_n++] = dcp;
+    dp = dnext;
+  }
+  if (dp == line_start) {
+    lo = para_n;
+    found_lo = true;
+  }
+  if (dp == line_end) {
+    hi = para_n;
+    found_hi = true;
+  }
+  if (!found_lo || !found_hi || hi < lo ||
+      (hi - lo) + (suffix_codepoint ? 1u : 0u) > BIDI_MAX_CODEPOINTS) {
+    return false;
+  }
+
+  const int base_level = bidi_base_level_utf8(para_start, para_end);
+  bidi_resolve_paragraph(ws->cps, para_n, base_level, ws);
+
+  Codepoint *const line_cps = ws->visual;
+  uint8_t *const line_lvl = ws->type;
+  size_t m = 0;
+  Codepoint prev_sh = 0;
+  for (size_t k = lo; k > 0; k--) {
+    if (!arabic_is_transparent(ws->cps[k - 1])) {
+      prev_sh = ws->cps[k - 1];
+      break;
+    }
+  }
+
+  size_t k = lo;
+  while (k < hi) {
+    const Codepoint cur = ws->cps[k];
+    Codepoint nxt = 0;
+    size_t nxt_idx = para_n;
+    for (size_t j = k + 1; j < para_n; j++) {
+      if (!arabic_is_transparent(ws->cps[j])) {
+        nxt = ws->cps[j];
+        nxt_idx = j;
+        break;
+      }
+    }
+
+    bool consumed = false;
+    Codepoint shaped;
+    if (codepoint_is_regional_indicator(cur)) {
+      shaped = FLAG_CODEPOINT;
+      consumed = (nxt_idx < hi) && codepoint_is_regional_indicator(nxt);
+    } else if (arabic_is_transparent(cur)) {
+      shaped = cur;
+    } else {
+      shaped = arabic_shape_pair(prev_sh, cur, nxt, &consumed);
+      if (consumed && nxt_idx >= hi) {
+        consumed = false;
+        shaped = arabic_shape_codepoint(prev_sh, cur, nxt);
+      }
+    }
+
+    line_cps[m] = shaped;
+    line_lvl[m] = ws->level[k];
+    m++;
+    if (consumed) {
+      for (size_t j = k + 1; j < nxt_idx; j++) {
+        line_cps[m] = ws->cps[j];
+        line_lvl[m] = ws->level[j];
+        m++;
+      }
+      prev_sh = nxt;
+      k = nxt_idx + 1;
+    } else {
+      if (!arabic_is_transparent(cur)) {
+        prev_sh = cur;
+      }
+      k++;
+    }
+  }
+
+  if (suffix_codepoint) {
+    line_cps[m] = suffix_codepoint;
+    line_lvl[m] = (uint8_t)base_level;
+    m++;
+  }
+
+  const size_t count = bidi_apply_line(line_cps, line_lvl, m, base_level, ws->cps, ws);
+  int width_px = 0;
+  for (size_t i = 0; i < count; i++) {
+    if (!prv_codepoint_is_invisible(ws->cps[i])) {
+      width_px +=
+          prv_codepoint_get_horizontal_advance(&ctx->font_cache, text_box_params->font, ws->cps[i]);
+    }
+  }
+
+  *result = (BidiVisualLine){
+      .count = count,
+      .width_px = width_px,
+      .base_level = base_level,
+      .suffix_in_visual = (suffix_codepoint != 0),
+  };
+  return true;
+}
+
+static bool prv_get_exact_bidi_width(GContext *ctx, const TextBoxParams *text_box_params,
+                                     utf8_t *line_start, utf8_t *line_end,
+                                     Codepoint suffix_codepoint, int *width_px) {
+  if (text_box_params->utf8_bounds == NULL || text_box_params->utf8_bounds->end == NULL ||
+      line_start == NULL || line_end == NULL) {
+    return false;
+  }
+
+  const bool nl_as_space = (text_box_params->overflow_mode == GTextOverflowModeFill);
+  utf8_t *para_start = NULL;
+  utf8_t *para_end = NULL;
+  prv_paragraph_bounds(text_box_params->utf8_bounds->start, text_box_params->utf8_bounds->end,
+                       line_start, nl_as_space, &para_start, &para_end);
+  if (!bidi_contains_rtl(para_start, para_end) && bidi_base_level_utf8(para_start, para_end) != 1) {
+    return false;
+  }
+
+  BidiScratch *ws = task_malloc(sizeof(BidiScratch));
+  if (ws == NULL) {
+    return false;
+  }
+  BidiVisualLine visual;
+  const bool success =
+      prv_build_bidi_visual_line(ctx, text_box_params, para_start, para_end, line_start, line_end,
+                                 suffix_codepoint, ws, &visual);
+  if (success) {
+    *width_px = visual.width_px;
+  }
+  task_free(ws);
+  return success;
+}
+
 //! Call char_visitor_cb on each character in the line
 //! Used to update line dimensions and render characters
 //! Traverse until end of line->width_px if rendering chars, else text_box_params width
@@ -832,61 +1008,70 @@ utf8_t* walk_line(GContext* ctx, Line* line, const TextBoxParams* const text_box
     utf8_t *fit_end = line->start;
     utf8_t *last_cp_start = NULL;
     utf8_t *p = (utf8_t *)line->start;
-    while (p < line_end && *p != '\0' && (nl_as_space || *p != '\n') && fit_cps < fit_cap) {
-      utf8_t *pnext = NULL;
-      Codepoint cp = utf8_peek_codepoint(p, &pnext);
-      if (cp == 0 || pnext == NULL) {
-        break;
+    bool cap_truncated = false;
+    if (line->bidi_text_end != NULL) {
+      fit_end = line->bidi_text_end;
+      while (p < fit_end && p < line_end && *p != '\0' && fit_cps < fit_cap) {
+        utf8_t *pnext = NULL;
+        const Codepoint cp = utf8_peek_codepoint(p, &pnext);
+        if (cp == 0 || pnext == NULL || pnext > fit_end) {
+          break;
+        }
+        fit_cps++;
+        last_cp_start = p;
+        p = pnext;
       }
-      if (nl_as_space && cp == '\n') {
-        cp = ' ';  // Fill mode: newline measures and reorders as a space.
-      }
-      fit_cps++;
-      if (prv_codepoint_is_invisible(cp)) {
-        // Formatting codepoints (ZWNJ, directional marks, ...) are not
-        // transparent to joining: the builder and the standard path make them
-        // the previous codepoint, breaking the join, so measurement must too.
-        prev_cp = cp;
+      cap_truncated = (p != fit_end);
+    } else {
+      while (p < line_end && *p != '\0' && (nl_as_space || *p != '\n') && fit_cps < fit_cap) {
+        utf8_t *pnext = NULL;
+        Codepoint cp = utf8_peek_codepoint(p, &pnext);
+        if (cp == 0 || pnext == NULL) {
+          break;
+        }
+        if (nl_as_space && cp == '\n') {
+          cp = ' ';
+        }
+        fit_cps++;
+        if (prv_codepoint_is_invisible(cp)) {
+          prev_cp = cp;
+          last_cp_start = p;
+          p = pnext;
+          fit_end = p;
+          continue;
+        }
+        if (skip_ligature_member && !arabic_is_transparent(cp)) {
+          skip_ligature_member = false;
+        } else {
+          int glyph_width;
+          if (arabic_is_transparent(cp)) {
+            glyph_width =
+                prv_codepoint_get_horizontal_advance(&ctx->font_cache, text_box_params->font, cp);
+          } else {
+            Codepoint next_cp = prv_peek_next_letter(p, line_end);
+            Codepoint shaped_cp;
+            glyph_width = prv_shaped_glyph_advance(ctx, text_box_params, prev_cp, cp, next_cp,
+                                                   &skip_ligature_member, &shaped_cp);
+            glyph_width = prv_mirror_aware_advance(ctx, text_box_params, shaped_cp, glyph_width);
+          }
+          if (content_width_px + glyph_width + suffix_width_px > available_horiz_px) {
+            break;
+          }
+          content_width_px += glyph_width;
+        }
+        if (!arabic_is_transparent(cp)) {
+          prev_cp = cp;
+        }
         last_cp_start = p;
         p = pnext;
         fit_end = p;
-        continue;
       }
-      if (skip_ligature_member && !arabic_is_transparent(cp)) {
-        // Alef already counted in the preceding Lam-Alef ligature.
-        skip_ligature_member = false;
-      } else {
-        int glyph_width;
-        if (arabic_is_transparent(cp)) {
-          glyph_width = prv_codepoint_get_horizontal_advance(&ctx->font_cache,
-              text_box_params->font, cp);
-        } else {
-          Codepoint next_cp = prv_peek_next_letter(p, line_end);
-          Codepoint shaped_cp;
-          glyph_width = prv_shaped_glyph_advance(ctx, text_box_params, prev_cp, cp, next_cp,
-                                                 &skip_ligature_member, &shaped_cp);
-          glyph_width = prv_mirror_aware_advance(ctx, text_box_params, shaped_cp, glyph_width);
-        }
-        if (content_width_px + glyph_width + suffix_width_px > available_horiz_px) {
-          break;
-        }
-        content_width_px += glyph_width;
-      }
-      if (!arabic_is_transparent(cp)) {
-        prev_cp = cp;
-      }
-      last_cp_start = p;
-      p = pnext;
-      fit_end = p;
-    }
 
-    // If the codepoint cap stopped the scan before the width or the paragraph
-    // did, reordering would silently drop the tail. Fall through to the
-    // standard path instead: complete logical-order text beats truncated
-    // reordered text. (Reaching the cap inside one display line takes
-    // hundreds of codepoints - adversarial, not real notifications.)
-    const bool cap_truncated =
-        (fit_cps >= fit_cap) && p < line_end && *p != '\0' && (nl_as_space || *p != '\n');
+      // If the cap stopped the scan before the width or paragraph boundary,
+      // fall back instead of dropping the tail.
+      cap_truncated =
+          (fit_cps >= fit_cap) && p < line_end && *p != '\0' && (nl_as_space || *p != '\n');
+    }
 
     // Trim trailing spaces like the standard path: they must not consume
     // width or sit between the content and its suffix. In Fill mode a trailing
@@ -916,196 +1101,71 @@ utf8_t* walk_line(GContext* ctx, Line* line, const TextBoxParams* const text_box
       bidi_ws = task_malloc(sizeof(BidiScratch));
     }
     if (bidi_ws) {
-      // Decode the paragraph, tracking where this line's slice begins and
-      // ends. In Fill mode a newline reads as a space. A paragraph beyond the
-      // resolver's capacity falls back to the standard path.
-      size_t para_n = 0;
-      size_t lo = 0, hi = 0;
-      bool para_overflow = false;
-      utf8_t *dp = para_start;
-      while (dp < para_end && *dp != '\0') {
-        if (dp == line->start) lo = para_n;
-        if (dp == fit_end) hi = para_n;
-        utf8_t *dnext = NULL;
-        Codepoint dcp = utf8_peek_codepoint(dp, &dnext);
-        if (dcp == 0 || dnext == NULL) break;
-        if (para_n >= BIDI_MAX_CODEPOINTS) {
-          // More paragraph remains: resolving a truncated prefix would give
-          // early lines wrong context (and mix strategies within one
-          // paragraph), so every line of an over-cap paragraph falls back.
-          para_overflow = true;
-          break;
-        }
-        if (nl_as_space && dcp == '\n') dcp = ' ';
-        bidi_ws->cps[para_n++] = dcp;
-        dp = dnext;
-      }
-      if (dp == line->start) lo = para_n;
-      if (dp == fit_end) hi = para_n;
+      BidiVisualLine visual;
+      if (prv_build_bidi_visual_line(ctx, text_box_params, para_start, para_end, line->start,
+                                     fit_end, line->suffix_codepoint, bidi_ws, &visual)) {
+        bidi_rendered = true;
+        suffix_in_visual = visual.suffix_in_visual;
 
-      if (!para_overflow && hi > lo &&
-          (hi - lo) + (line->suffix_codepoint ? 1u : 0u) <= BIDI_MAX_CODEPOINTS) {
-        int base_level = bidi_base_level_utf8(para_start, para_end);
-        bidi_resolve_paragraph(bidi_ws->cps, para_n, base_level, bidi_ws);
+        GTextAlignment eff_align = text_box_params->alignment;
+        if (eff_align == GTextAlignmentLeft && visual.base_level == 1) {
+          eff_align = GTextAlignmentRight;
+        }
+        int pen_shift = 0;
+        const int width_delta = (int)line->width_px - visual.width_px;
+        if (width_delta > 0) {
+          if (eff_align == GTextAlignmentRight) {
+            pen_shift = width_delta;
+          } else if (eff_align == GTextAlignmentCenter) {
+            pen_shift = width_delta / 2;
+          }
+        }
+        walked_width_px = pen_shift;
 
-        // Build this line's shaped codepoints with their paragraph-resolved
-        // levels, folding pairs exactly like the measurement pass: regional
-        // indicators to one flag, Lam-Alef to one ligature (a pair member
-        // beyond the line end shapes contextually but is not folded away).
-        // Joining context comes from the paragraph, not the slice, so Arabic
-        // forms stay correct across the wrap. Scratch reuse: paragraph state
-        // lives in cps/level; the folded line goes to visual (codepoints) and
-        // type (levels); apply writes visual order over cps, which is no
-        // longer needed by then.
-        Codepoint *const line_cps = bidi_ws->visual;
-        uint8_t *const line_lvl = bidi_ws->type;
-        size_t m = 0;
-        Codepoint prev_sh = 0;
-        for (size_t k = lo; k > 0; k--) {
-          if (!arabic_is_transparent(bidi_ws->cps[k - 1])) {
-            prev_sh = bidi_ws->cps[k - 1];
-            break;
+        int base_x = pen_shift;
+        int base_adv = 0;
+        for (size_t v = 0; v < visual.count; v++) {
+          const Codepoint vcp = bidi_ws->cps[v];
+          if (prv_codepoint_is_invisible(vcp)) {
+            continue;
           }
-        }
-        size_t k = lo;
-        while (k < hi) {
-          Codepoint cur = bidi_ws->cps[k];
-          Codepoint nxt = 0;
-          size_t nxt_idx = para_n;
-          for (size_t j = k + 1; j < para_n; j++) {
-            if (!arabic_is_transparent(bidi_ws->cps[j])) {
-              nxt = bidi_ws->cps[j];
-              nxt_idx = j;
-              break;
-            }
-          }
-          bool consumed = false;
-          Codepoint sh;
-          if (codepoint_is_regional_indicator(cur)) {
-            sh = FLAG_CODEPOINT;
-            consumed = (nxt_idx < hi) && codepoint_is_regional_indicator(nxt);
-          } else if (arabic_is_transparent(cur)) {
-            sh = cur;  // a mark keeps its own glyph
-          } else {
-            sh = arabic_shape_pair(prev_sh, cur, nxt, &consumed);
-            if (consumed && nxt_idx >= hi) {
-              // Pair partner is on the next line: shape contextually, no fold.
-              consumed = false;
-              sh = arabic_shape_codepoint(prev_sh, cur, nxt);
-            }
-          }
-          line_cps[m] = sh;
-          line_lvl[m] = bidi_ws->level[k];
-          m++;
-          if (consumed) {
-            // Emit any marks sitting between the pair, then skip the partner.
-            // The joining predecessor for the next letter is the consumed
-            // partner (the Alef, which does not connect forward) - not the
-            // Lam - matching what the fitting pass and arabic_shape_text()
-            // see when they walk every codepoint.
-            for (size_t j = k + 1; j < nxt_idx; j++) {
-              line_cps[m] = bidi_ws->cps[j];
-              line_lvl[m] = bidi_ws->level[j];
-              m++;
-            }
-            prev_sh = nxt;
-            k = nxt_idx + 1;
-          } else {
-            if (!arabic_is_transparent(cur)) {
-              prev_sh = cur;
-            }
-            k++;
-          }
-        }
-        // The suffix is logically after the truncated content; at the base
-        // level it lands at the visual end of the reading direction (the left
-        // edge of an RTL line).
-        if (line->suffix_codepoint && m < BIDI_MAX_CODEPOINTS) {
-          line_cps[m] = line->suffix_codepoint;
-          line_lvl[m] = (uint8_t)base_level;
-          m++;
-          suffix_in_visual = true;
-        }
-
-        size_t n_vis = bidi_apply_line(line_cps, line_lvl, m, base_level, bidi_ws->cps, bidi_ws);
-        if (n_vis > 0) {
-          bidi_rendered = true;
-          // The measured line width prices mirrored codepoints conservatively
-          // (wider of the pair), so the drawn run can be narrower. Compute the
-          // exact drawn width and place the run flush per the effective
-          // alignment - alignment error then cannot accumulate, whatever the
-          // pricing policy.
-          int drawn_w = 0;
-          for (size_t v = 0; v < n_vis; v++) {
-            Codepoint vcp = bidi_ws->cps[v];
-            if (prv_codepoint_is_invisible(vcp)) continue;
-            drawn_w += prv_codepoint_get_horizontal_advance(&ctx->font_cache,
-                text_box_params->font, vcp);
-          }
-          GTextAlignment eff_align = text_box_params->alignment;
-          if (eff_align == GTextAlignmentLeft && base_level == 1) {
-            eff_align = GTextAlignmentRight;  // same rule as prv_line_justify()
-          }
-          int pen_shift = 0;
-          const int width_delta = (int)line->width_px - drawn_w;
-          if (width_delta > 0) {
-            if (eff_align == GTextAlignmentRight) pen_shift = width_delta;
-            else if (eff_align == GTextAlignmentCenter) pen_shift = width_delta / 2;
-          }
-          walked_width_px = pen_shift;
-          // Pen position of the last full-advance glyph, for anchoring the
-          // zero-advance combining marks that follow it.
-          int base_x = pen_shift;
-          int base_adv = 0;
-          for (size_t v = 0; v < n_vis; v++) {
-            Codepoint vcp = bidi_ws->cps[v];
-            if (prv_codepoint_is_invisible(vcp)) {
-              continue;
-            }
-            int glyph_width = prv_codepoint_get_horizontal_advance(&ctx->font_cache,
-                text_box_params->font, vcp);
-            GRect cursor = {
+          const int glyph_width =
+              prv_codepoint_get_horizontal_advance(&ctx->font_cache, text_box_params->font, vcp);
+          GRect cursor = {
               .origin = line->origin,
               .size.w = glyph_width,
               .size.h = fonts_get_font_height(text_box_params->font),
-            };
-            cursor.origin.x += walked_width_px;
-            if (!codepoint_is_zero_width(vcp) && !codepoint_is_unicode_space(vcp)) {
-              const GlyphData *glyph =
-                  text_resources_get_glyph(&ctx->font_cache, vcp, text_box_params->font, NULL);
-              if (glyph_width == 0 && glyph != NULL) {
-                // A zero-advance combining mark: anchor it on its base. The
-                // shipped fonts carry both pen conventions (mark drawn from
-                // the base's own pen, or from the pen after its advance), and
-                // bearing sign alone does not discriminate them - so place
-                // the mark at whichever pen lands more of its bitmap on the
-                // base's cell.
-                const int m_left = glyph->header.left_offset_px;
-                const int m_w = glyph->header.width_px;
-                int best_pen = base_x;
-                int best_overlap = -1;
-                const int pens[2] = { base_x, base_x + base_adv };
-                for (int pi = 0; pi < 2; pi++) {
-                  int span_lo = pens[pi] + m_left;
-                  int span_hi = span_lo + m_w;
-                  int o_lo = (span_lo > base_x) ? span_lo : base_x;
-                  int o_hi = (span_hi < base_x + base_adv) ? span_hi : base_x + base_adv;
-                  int overlap = (o_hi > o_lo) ? (o_hi - o_lo) : 0;
-                  if (overlap > best_overlap) {
-                    best_overlap = overlap;
-                    best_pen = pens[pi];
-                  }
+          };
+          cursor.origin.x += walked_width_px;
+          if (!codepoint_is_zero_width(vcp) && !codepoint_is_unicode_space(vcp)) {
+            const GlyphData *glyph =
+                text_resources_get_glyph(&ctx->font_cache, vcp, text_box_params->font, NULL);
+            if (glyph_width == 0 && glyph != NULL) {
+              const int m_left = glyph->header.left_offset_px;
+              const int m_w = glyph->header.width_px;
+              int best_pen = base_x;
+              int best_overlap = -1;
+              const int pens[2] = {base_x, base_x + base_adv};
+              for (int pi = 0; pi < 2; pi++) {
+                const int span_lo = pens[pi] + m_left;
+                const int span_hi = span_lo + m_w;
+                const int o_lo = (span_lo > base_x) ? span_lo : base_x;
+                const int o_hi = (span_hi < base_x + base_adv) ? span_hi : base_x + base_adv;
+                const int overlap = (o_hi > o_lo) ? (o_hi - o_lo) : 0;
+                if (overlap > best_overlap) {
+                  best_overlap = overlap;
+                  best_pen = pens[pi];
                 }
-                cursor.origin.x = line->origin.x + best_pen;
               }
-              render_glyph(ctx, vcp, text_box_params->font, cursor);
+              cursor.origin.x = line->origin.x + best_pen;
             }
-            if (glyph_width > 0) {
-              base_x = walked_width_px;
-              base_adv = glyph_width;
-            }
-            walked_width_px += glyph_width;
+            render_glyph(ctx, vcp, text_box_params->font, cursor);
           }
+          if (glyph_width > 0) {
+            base_x = walked_width_px;
+            base_adv = glyph_width;
+          }
+          walked_width_px += glyph_width;
         }
       }
       task_free(bidi_ws);
@@ -1135,6 +1195,10 @@ utf8_t* walk_line(GContext* ctx, Line* line, const TextBoxParams* const text_box
     }
     // Bidi render did not run: continue into the standard path (which draws
     // the suffix itself).
+    if (line->bidi_text_end != NULL) {
+      // Preserve the accepted logical slice if bidi scratch allocation fails.
+      available_horiz_px = INT_MAX;
+    }
   }
 
   // Standard rendering path (no RTL or not rendering)
@@ -1180,7 +1244,8 @@ utf8_t* walk_line(GContext* ctx, Line* line, const TextBoxParams* const text_box
 
   utf8_t* last_visited_char = NULL;
 
-  while (walked_width_px + next_glyph_width_px + suffix_width_px <= available_horiz_px) {
+  while ((line->bidi_text_end == NULL || utf8_iter_state->current < line->bidi_text_end) &&
+         walked_width_px + next_glyph_width_px + suffix_width_px <= available_horiz_px) {
     GRect cursor = {
       .origin = line->origin,
       .size.w = next_glyph_width_px,
@@ -1326,6 +1391,7 @@ void set_ellipsis_on_overflow_last_line_cb(GContext* ctx, Line* line,
   }
 
   line->suffix_codepoint = ELLIPSIS_CODEPOINT;
+  line->bidi_text_end = NULL;
 
   // update the line dimensions
   walk_line(ctx, line, text_box_params, update_dimensions_char_visitor_cb);
@@ -1405,18 +1471,21 @@ T_STATIC NOINLINE MOCKABLE void prv_debug_perimeter(GContext *ctx, const GRangeH
 typedef struct {
   int16_t origin_x;
   int16_t width_px;
+  utf8_t *bidi_text_end;
 } OrphanLineState;
 
 static OrphanLineState prv_capture_orphan_state(Line const* line) {
-  return (OrphanLineState) {
-    .origin_x = line->origin.x,
-    .width_px = line->width_px,
+  return (OrphanLineState){
+      .origin_x = line->origin.x,
+      .width_px = line->width_px,
+      .bidi_text_end = line->bidi_text_end,
   };
 }
 
 static void prv_apply_orphan_state(const OrphanLineState *state, Line *line) {
   line->origin.x = state->origin_x;
   line->width_px = state->width_px;
+  line->bidi_text_end = state->bidi_text_end;
 }
 
 //! Iterate over lines in the text box
@@ -1590,12 +1659,31 @@ bool line_add_word(GContext* ctx, Line* line, Word* word, const TextBoxParams* c
 
   bool is_overflow = (line->width_px + word->width_px > line->max_width_px);
   bool is_start_of_line = (line->width_px == 0);
-  bool should_hyphenate = (is_overflow && is_start_of_line);
 
   if (is_start_of_line) {
     line->start = word->start;
   }
 
+  // Conservative mirror pricing can reject a slice whose reordered glyphs
+  // fit. Once that happens, measure each following candidate through the same
+  // shaping and reordering path used by the renderer.
+  if (is_overflow || line->bidi_text_end != NULL) {
+    int exact_width_px = 0;
+    if (prv_get_exact_bidi_width(ctx, text_box_params, line->start, word->end, 0,
+                                 &exact_width_px)) {
+      if (exact_width_px <= line->max_width_px) {
+        PBL_ASSERTN(line->suffix_codepoint == 0);
+        line->width_px = exact_width_px;
+        line->bidi_text_end = word->end;
+        return true;
+      }
+      is_overflow = true;
+    } else if (line->bidi_text_end != NULL) {
+      is_overflow = true;
+    }
+  }
+
+  const bool should_hyphenate = (is_overflow && is_start_of_line);
   if (should_hyphenate) {
     // Set suffix character
     // [CJK] - when breaking a Katakana word, you probably don't want to add a hyphen. And to
