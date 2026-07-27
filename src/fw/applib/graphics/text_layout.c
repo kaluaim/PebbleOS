@@ -48,6 +48,18 @@ static int prv_mirror_aware_advance(GContext *ctx, const TextBoxParams *text_box
 static bool prv_paragraph_may_reorder(const TextBoxParams *text_box_params, const utf8_t *pos,
                                       bool nl_as_space);
 
+//! Lazily-evaluated prv_paragraph_may_reorder() answer for one word or line.
+//! Mirror-aware pricing only matters for a codepoint with a bidi mirror, so
+//! the paragraph scan the gate needs is deferred until such a codepoint
+//! actually appears - most words and lines have none and never scan.
+typedef struct {
+  bool known;
+  bool reorders;
+} ReorderGate;
+
+static int prv_priced_advance(GContext *ctx, const TextBoxParams *text_box_params, Codepoint cp,
+                              int advance, const utf8_t *pos, ReorderGate *gate);
+
 //! Check if a codepoint is invisible: formatting indicator or should-skip (no direction, no width).
 static bool prv_codepoint_is_invisible(Codepoint cp) {
   return codepoint_is_formatting_indicator(cp) || codepoint_should_skip(cp);
@@ -325,8 +337,7 @@ bool word_init(GContext* ctx, Word* word, const TextBoxParams* const text_box_pa
   bool skip_ligature_member = false;
   const utf8_t *bounds_end =
       (text_box_params->utf8_bounds != NULL) ? text_box_params->utf8_bounds->end : NULL;
-  const bool may_reorder = prv_paragraph_may_reorder(text_box_params, word->start,
-      text_box_params->overflow_mode == GTextOverflowModeFill);
+  ReorderGate reorder_gate = {0};
 
   do {
     utf8_t *curr_pos = utf8_iter_state->current;
@@ -353,9 +364,7 @@ bool word_init(GContext* ctx, Word* word, const TextBoxParams* const text_box_pa
         Codepoint width_cp = prv_shape_pair(prev_cp, curr_cp, shape_next, &consumed_next);
         int adv = prv_codepoint_get_horizontal_advance(&ctx->font_cache,
             text_box_params->font, width_cp);
-        if (may_reorder) {
-          adv = prv_mirror_aware_advance(ctx, text_box_params, width_cp, adv);
-        }
+        adv = prv_priced_advance(ctx, text_box_params, width_cp, adv, word->start, &reorder_gate);
         word->width_px += adv;
         skip_ligature_member = consumed_next;
       }
@@ -739,8 +748,27 @@ static bool prv_paragraph_may_reorder(const TextBoxParams *text_box_params, cons
   utf8_t *para_end = NULL;
   prv_paragraph_bounds(text_box_params->utf8_bounds->start, text_box_params->utf8_bounds->end,
                        pos, nl_as_space, &para_start, &para_end);
-  return bidi_contains_rtl(para_start, para_end) ||
-         bidi_base_level_utf8(para_start, para_end) == 1;
+  return bidi_paragraph_reorders(para_start, para_end);
+}
+
+//! Advance for the measurement paths: price cp mirror-aware only when the
+//! paragraph containing pos reorders, resolving that gate lazily through
+//! *gate. A codepoint with no mirror never consults the gate, so a word or
+//! line without mirrored punctuation skips the gate's paragraph scan.
+static int prv_priced_advance(GContext *ctx, const TextBoxParams *text_box_params, Codepoint cp,
+                              int advance, const utf8_t *pos, ReorderGate *gate) {
+  if (bidi_mirror(cp) == cp) {
+    return advance;
+  }
+  if (!gate->known) {
+    gate->reorders = prv_paragraph_may_reorder(text_box_params, pos,
+        text_box_params->overflow_mode == GTextOverflowModeFill);
+    gate->known = true;
+  }
+  if (!gate->reorders) {
+    return advance;
+  }
+  return prv_mirror_aware_advance(ctx, text_box_params, cp, advance);
 }
 
 typedef struct {
@@ -899,7 +927,7 @@ static bool prv_get_exact_bidi_width(GContext *ctx, const TextBoxParams *text_bo
   utf8_t *para_end = NULL;
   prv_paragraph_bounds(text_box_params->utf8_bounds->start, text_box_params->utf8_bounds->end,
                        line_start, nl_as_space, &para_start, &para_end);
-  if (!bidi_contains_rtl(para_start, para_end) && bidi_base_level_utf8(para_start, para_end) != 1) {
+  if (!bidi_paragraph_reorders(para_start, para_end)) {
     return false;
   }
 
@@ -977,8 +1005,7 @@ utf8_t* walk_line(GContext* ctx, Line* line, const TextBoxParams* const text_box
     // A paragraph with strong RTL, or a digit-only paragraph that resolves RTL
     // (Arabic-Indic numbers): the latter reorders to the identity, but a
     // truncation suffix still has to land at the visual start.
-    take_bidi_path = bidi_contains_rtl(para_start, para_end) ||
-                     bidi_base_level_utf8(para_start, para_end) == 1;
+    take_bidi_path = bidi_paragraph_reorders(para_start, para_end);
   }
   if (take_bidi_path) {
     const bool nl_as_space = (text_box_params->overflow_mode == GTextOverflowModeFill);
@@ -1228,8 +1255,7 @@ utf8_t* walk_line(GContext* ctx, Line* line, const TextBoxParams* const text_box
   // mirrored codepoints at the wider advance here too, or the hyphenation
   // split consumes a codepoint the render fit cannot fit (it is then drawn on
   // neither line).
-  const bool std_may_reorder = prv_paragraph_may_reorder(text_box_params, line->start,
-      text_box_params->overflow_mode == GTextOverflowModeFill);
+  ReorderGate std_gate = {0};
   bool skip_ligature_member = false;  // current codepoint was folded into a preceding pair
   bool consumed_next = false;
   bool current_folded = false;        // current codepoint was folded into the preceding pair
@@ -1237,10 +1263,8 @@ utf8_t* walk_line(GContext* ctx, Line* line, const TextBoxParams* const text_box
   Codepoint peek_cp = prv_peek_next_letter(utf8_iter_state->current, text_end);
   int next_glyph_width_px = prv_shaped_glyph_advance(ctx, text_box_params, prev_shaped_cp,
       current_codepoint, peek_cp, &consumed_next, &current_draw_cp);
-  if (std_may_reorder) {
-    next_glyph_width_px = prv_mirror_aware_advance(ctx, text_box_params, current_draw_cp,
-                                                   next_glyph_width_px);
-  }
+  next_glyph_width_px = prv_priced_advance(ctx, text_box_params, current_draw_cp,
+                                           next_glyph_width_px, line->start, &std_gate);
 
   utf8_t* last_visited_char = NULL;
 
@@ -1318,10 +1342,8 @@ utf8_t* walk_line(GContext* ctx, Line* line, const TextBoxParams* const text_box
       peek_cp = prv_peek_next_letter(utf8_iter_state->current, text_end);
       next_glyph_width_px = prv_shaped_glyph_advance(ctx, text_box_params, prev_shaped_cp,
           current_codepoint, peek_cp, &consumed_next, &current_draw_cp);
-      if (std_may_reorder) {
-        next_glyph_width_px = prv_mirror_aware_advance(ctx, text_box_params, current_draw_cp,
-                                                       next_glyph_width_px);
-      }
+      next_glyph_width_px = prv_priced_advance(ctx, text_box_params, current_draw_cp,
+                                               next_glyph_width_px, line->start, &std_gate);
     }
   }
 

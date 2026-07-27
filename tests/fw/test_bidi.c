@@ -71,6 +71,33 @@ void test_bidi__contains_rtl(void) {
   cl_assert(!bidi_contains_rtl((const utf8_t *)latin, (const utf8_t *)latin));
 }
 
+// The one-pass layout gate is exactly bidi_contains_rtl() ||
+// bidi_base_level_utf8() == 1: strong RTL anywhere gates, digit-only
+// Arabic-Indic and Persian text gates, and a strong L (even with Arabic-Indic
+// digits after it) does not.
+void test_bidi__paragraph_reorders_gate(void) {
+  static const char *const cases[] = {
+      "\xD9\x85\xD8\xB1",                  // Arabic word
+      "hi \xD7\x90",                       // Hebrew after Latin
+      "123 \xD9\x85\xD8\xB1",              // weak digits then Arabic
+      "\xD9\xA2\xD9\xA0\xD9\xA2\xD9\xA6",  // ٢٠٢٦ digit-only -> RTL deviation
+      "\xDB\xB1\xDB\xB2",                  // Persian digits only -> RTL deviation
+      "abc \xD9\xA2",                      // strong L first, Arabic-Indic digit after
+      "hello 123 (test)",                  // pure Latin
+      "!!!",                               // neutrals only
+      "",                                  // empty
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    const utf8_t *s = (const utf8_t *)cases[i];
+    const utf8_t *e = s + strlen(cases[i]);
+    const bool two_pass = bidi_contains_rtl(s, e) || bidi_base_level_utf8(s, e) == 1;
+    cl_assert_equal_i(bidi_paragraph_reorders(s, e), two_pass);
+  }
+  // Spot-check the expected verdicts themselves.
+  cl_assert(bidi_paragraph_reorders((const utf8_t *)cases[3], (const utf8_t *)cases[3] + 8));
+  cl_assert(!bidi_paragraph_reorders((const utf8_t *)cases[5], (const utf8_t *)cases[5] + 6));
+}
+
 // An output buffer that exactly holds the reordered UTF-8 plus its terminator
 // must not be truncated based on the worst-case codepoint width.
 void test_bidi__utf8_exact_capacity(void) {

@@ -63,13 +63,20 @@ int bidi_base_level(const Codepoint *cps, size_t n);
 int bidi_base_level_utf8(const utf8_t *start, const utf8_t *end);
 
 //! True if the range contains a strong RTL codepoint (bidi class R or AL:
-//! Hebrew, Arabic including supplements and presentation forms). Gates the
-//! bidi layout path with the same class table the reordering itself uses.
+//! Hebrew, Arabic including supplements and presentation forms), using the
+//! same class table the reordering itself uses.
 //! Distinct from bidi_base_level_utf8(): a digit-only Arabic-Indic paragraph
 //! has no strong codepoint, so this returns false, but its base level is 1.
-//! The renderer enters the bidi path on either condition, so a suffix on such
-//! a line still reorders to the visual start.
 bool bidi_contains_rtl(const utf8_t *start, const utf8_t *end);
+
+//! The bidi layout gate: true when a paragraph reorders, i.e. exactly
+//! bidi_contains_rtl() || bidi_base_level_utf8() == 1, folded into a single
+//! scan of the range (a strong RTL codepoint returns immediately; otherwise
+//! the digit-only deviation applies only when no strong L was seen either).
+//! The renderer, measurement pricing and alignment all gate on this, so a
+//! suffix on a digit-only Arabic-Indic line still reorders to the visual
+//! start and gating can never disagree with reordering.
+bool bidi_paragraph_reorders(const utf8_t *start, const utf8_t *end);
 
 //! Reorder a logical-order codepoint array into visual (left-to-right display)
 //! order, applying implicit bidi level resolution (weak types, bracket pairs,

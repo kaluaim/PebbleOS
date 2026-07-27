@@ -257,6 +257,37 @@ bool bidi_contains_rtl(const utf8_t *start, const utf8_t *end) {
   return false;
 }
 
+bool bidi_paragraph_reorders(const utf8_t *start, const utf8_t *end) {
+  // Exactly bidi_contains_rtl() || bidi_base_level_utf8() == 1, in one scan:
+  // any strong RTL codepoint gates immediately, and the digit-only deviation
+  // can only apply when no strong L appeared either (a strong L with no R/AL
+  // anywhere would be the first strong character, making the base level 0).
+  if (start == NULL || end == NULL || start >= end) {
+    return false;
+  }
+  bool saw_l = false;
+  bool saw_arabic_number = false;
+  utf8_t *ptr = (utf8_t *)start;
+  while (ptr < end && *ptr != '\0') {
+    utf8_t *next = NULL;
+    Codepoint cp = utf8_peek_codepoint(ptr, &next);
+    if (cp == 0 || next == NULL) {
+      break;
+    }
+    BidiClass c = prv_class(cp);
+    if (c == R || c == AL) {
+      return true;
+    }
+    if (c == L) {
+      saw_l = true;
+    } else if (c == AN || prv_in(cp, 0x06F0, 0x06F9)) {
+      saw_arabic_number = true;
+    }
+    ptr = next;
+  }
+  return saw_arabic_number && !saw_l;
+}
+
 int bidi_last_strong_utf8(const utf8_t *start, const utf8_t *end) {
   int found = BIDI_BOUNDARY_AUTO;
   if (start == NULL || end == NULL || start >= end) return found;
