@@ -71,6 +71,21 @@ void test_bidi__contains_rtl(void) {
   cl_assert(!bidi_contains_rtl((const utf8_t *)latin, (const utf8_t *)latin));
 }
 
+// An output buffer that exactly holds the reordered UTF-8 plus its terminator
+// must not be truncated based on the worst-case codepoint width.
+void test_bidi__utf8_exact_capacity(void) {
+  static BidiScratch ws;
+  const char logical[] = "\xD8\xA7\xD8\xA8";  // Alef Beh
+  const char visual[] = "\xD8\xA8\xD8\xA7";   // Beh Alef
+  utf8_t out[sizeof(visual)] = {0};
+
+  const size_t n =
+      bidi_reorder_utf8((const utf8_t *)logical, strlen(logical), out, sizeof(out), 1, &ws);
+
+  cl_assert_equal_i(n, strlen(visual));
+  cl_assert_equal_i(memcmp(out, visual, sizeof(visual)), 0);
+}
+
 // Hebrew is a strong RTL run like Arabic: it reverses to visual order.
 void test_bidi__hebrew_strong_run(void) {
   Codepoint out[8];

@@ -731,9 +731,11 @@ size_t bidi_reorder_utf8_ctx(const utf8_t *src, size_t src_len, utf8_t *dest, si
 
   size_t off = 0;
   for (size_t i = 0; i < vn; i++) {
-    if (off + 4 >= dest_size) break;
-    size_t w = utf8_encode_codepoint(ws->visual[i], dest + off);
+    utf8_t encoded[4];
+    size_t w = utf8_encode_codepoint(ws->visual[i], encoded);
     if (w == 0) continue;
+    if (w >= dest_size - off) break;
+    memcpy(dest + off, encoded, w);
     off += w;
   }
   if (off < dest_size) dest[off] = '\0';
