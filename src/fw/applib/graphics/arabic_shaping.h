@@ -48,6 +48,11 @@ Codepoint arabic_shape_codepoint(Codepoint prev_cp, Codepoint curr_cp, Codepoint
 Codepoint arabic_shape_pair(Codepoint prev_cp, Codepoint curr_cp, Codepoint next_cp,
                             bool *consumed_next);
 
+//! Caps codepoints per arabic_shape_text() call. The bidi render path shapes
+//! per codepoint with paragraph context and no longer uses this helper; the
+//! cap covers its remaining (test and utility) callers.
+#define MAX_SHAPE_CODEPOINTS 96
+
 //! Shape Arabic text by converting basic Arabic letters to their
 //! contextual presentation forms based on position in words.
 //!
@@ -59,7 +64,10 @@ Codepoint arabic_shape_pair(Codepoint prev_cp, Codepoint curr_cp, Codepoint next
 //! @param src_len Length of source string in bytes
 //! @param dest Destination buffer for shaped text
 //! @param dest_size Size of destination buffer in bytes
+//! @param cp_scratch Working array for at least MAX_SHAPE_CODEPOINTS
+//!        codepoints. Caller-provided so the render path can keep it off the
+//!        2-4 KiB task stacks (it reuses the bidi heap scratch).
 //! @return Number of bytes written to dest (excluding null terminator),
 //!         or 0 on failure
 size_t arabic_shape_text(const utf8_t *src, size_t src_len,
-                         utf8_t *dest, size_t dest_size);
+                         utf8_t *dest, size_t dest_size, Codepoint *cp_scratch);
