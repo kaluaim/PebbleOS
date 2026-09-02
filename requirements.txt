@@ -6,7 +6,8 @@ svg.path
 bitarray
 polib
 
-# Build system (waf) tooling
+# Build system tooling (CMake comes from the system, see
+# requirements-brew.txt)
 sh<2
 packaging
 PyYAML
